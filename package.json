@@ -67,8 +67,11 @@
     "application:init": "node application-artifacts.mjs --init",
     "build:dashboard": "node build-dashboard.mjs",
     "serve:dashboard": "cd dashboard && go run .",
-    "postinstall": "npx playwright install chromium --with-deps || npx playwright install chromium --with-deps",
-    "manifesto": "node manifesto.mjs"
+    "postinstall": "patch-package && (npx playwright install chromium --with-deps || npx playwright install chromium --with-deps)",
+    "manifesto": "node manifesto.mjs",
+    "whatsapp:watch": "node plugins.local/whatsapp/watch.mjs",
+    "whatsapp:backfill": "node plugins.local/whatsapp/watch.mjs --backfill",
+    "whatsapp:ingest": "node plugins.mjs run whatsapp"
   },
   "keywords": [
     "ai",
@@ -98,6 +101,12 @@
     "@google/generative-ai": "^0.24.1",
     "dotenv": "^17.0.0",
     "js-yaml": "^5.3.0",
-    "playwright": "1.62.1"
+    "nodemailer": "^10.0.12",
+    "playwright": "1.62.1",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.26.0"
+  },
+  "devDependencies": {
+    "patch-package": "^8.0.1"
   }
 }

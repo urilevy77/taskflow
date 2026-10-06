@@ -53,7 +53,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'fs';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import * as yaml from 'js-yaml';
@@ -3067,6 +3067,24 @@ async function main() {
   const errors = [...resolveErrors];
   const emptyTargets = [];
 
+  // Skipped-roles log: every posting a filter rejects is recorded with its
+  // reason, so a role dropped by mistake (e.g. "Forward Deployed Engineer"
+  // before its keyword existed) can be spotted and the filters tuned.
+  // Written to Skipped/{date}.txt at the end of the run (see writeSkippedLog).
+  const skippedRoles = [];
+  const skip = (job, fallbackCompany, reason) => {
+    skippedRoles.push(`${job.title || '(no title)'} — ${job.company || fallbackCompany || '?'} — ${reason}`);
+  };
+  const titleSkipReason = (title) => {
+    const tf = config.title_filter ?? {};
+    const lower = String(title || '').toLowerCase();
+    for (const k of Array.isArray(tf.negative) ? tf.negative : []) {
+      if (typeof k !== 'string' || !k.trim()) continue;
+      if (compileKeyword(k.trim().toLowerCase())(lower)) return `blocked by negative title keyword "${k}"`;
+    }
+    return 'no positive title keyword matched';
+  };
+
   // Arm the failure-path row (#2643) now that the sweep is about to start and
   // every counter it reads is in scope. new_added is hardcoded 0 on a failed
   // run even if the sweep added postings before dying (the count isn't settled
@@ -3093,8 +3111,54 @@ async function main() {
     });
   }
 
+  // Per-source "last scanned" state (data/scan-sources.json). Each source that
+  // fetches successfully records when it was scanned; the next run starts that
+  // source from there (minus a 1-day overlap) instead of the full
+  // max_posting_age_days window. It is written after EVERY source, not at the
+  // end, so a run killed by the daily timeout keeps what it finished.
+  //
+  // The stored times are only trusted while the filters are unchanged: a
+  // posting rejected by yesterday's filters was never recorded anywhere, so
+  // after a filter edit the old window must be re-read in full. A hash of the
+  // filter settings guards that. An explicit --since/--posted-after always wins.
+  const SOURCES_PATH = path.join(DATA_ROOT, 'data', 'scan-sources.json');
+  const SOURCE_OVERLAP_MS = 24 * 3600 * 1000;
+  const filterSig = createHash('sha1').update(JSON.stringify([
+    config.title_filter, config.location_filter, config.content_filter,
+    config.skip_tiers, config.max_posting_age_days, config.salary_filter, config.visa_filter,
+  ])).digest('hex');
+  let sourceState = { filterSig, sources: {} };
+  try {
+    if (existsSync(SOURCES_PATH)) {
+      const saved = JSON.parse(readFileSync(SOURCES_PATH, 'utf-8'));
+      if (saved && saved.sources && typeof saved.sources === 'object') {
+        sourceState = { filterSig, sources: saved.filterSig === filterSig ? saved.sources : {} };
+        if (saved.filterSig !== filterSig) console.log('Filters changed since the last scan — re-reading the full posting window for every source.');
+      }
+    }
+  } catch { /* unreadable state file → behave as a first run */ }
+  const previousScans = { ...sourceState.sources };
+  const recordSourceScan = (name, startedAtMs, sinceMs, found) => {
+    sourceState.sources[name] = {
+      lastScanned: new Date(startedAtMs).toISOString(),
+      startedFrom: sinceMs ? new Date(sinceMs).toISOString() : 'full window',
+      found,
+    };
+    try {
+      mkdirSync(path.dirname(SOURCES_PATH), { recursive: true });
+      const tmp = `${SOURCES_PATH}.tmp`;
+      writeFileSync(tmp, JSON.stringify(sourceState, null, 2), 'utf-8');
+      renameSync(tmp, SOURCES_PATH);
+    } catch { /* state is an optimisation; never fail a scan over it */ }
+  };
+
   const tasks = targets.map(company => async () => {
     let provider = company._provider;
+    const sourceStartedAt = Date.now();
+    const lastMs = Date.parse(previousScans[company.name]?.lastScanned ?? '');
+    const sourceSinceMs = (!effectiveAfter && Number.isFinite(lastMs))
+      ? Math.max(earlyStopSinceMs ?? 0, lastMs - SOURCE_OVERLAP_MS)
+      : earlyStopSinceMs;
     // includeUndated is deliberately ALWAYS true, independent of the window.
     // It does not mean "include undated postings in the results" — scan.mjs
     // already decides that downstream, where buildPostedDateFilter passes a
@@ -3111,7 +3175,7 @@ async function main() {
     // every tenant that mixes.
     const ctx = {
       ...makeHttpCtx(),
-      sinceMs: earlyStopSinceMs,
+      sinceMs: sourceSinceMs,
       includeUndated: true,
       locationHints: config.location_filter,
     };
@@ -3156,6 +3220,7 @@ async function main() {
           if (blEntry) {
             if (!includeBlacklisted) {
               totalFilteredBlacklist++;
+              skip(job, company.name, 'company is on the blacklist');
               continue;
             }
             annotatedBlacklisted++;
@@ -3169,40 +3234,49 @@ async function main() {
 
         if (!titleFilter(job.title)) {
           totalFilteredTitle++;
+          skip(job, company.name, titleSkipReason(job.title));
           continue;
         }
         if (classifyTier && skipTiers.includes(classifyTier(job.title))) {
           totalFilteredTier++;
+          skip(job, company.name, `seniority tier "${classifyTier(job.title)}" is in skip_tiers`);
           continue;
         }
         // job.title is passed so a role whose remoteness is stated in the title
         // ("Program Manager - Remote") isn't rejected for a city-only location.
         if (!locationFilter(job.location, job.url, job.title)) {
           totalFilteredLocation++;
+          skip(job, company.name, `location not allowed (${job.location || 'none'})`);
           continue;
         }
         if (!postingAgeFilter(job.postedAt)) {
           totalFilteredPostingAge++;
+          skip(job, company.name, `posted more than ${config.max_posting_age_days} days ago`);
           continue;
         }
         if (!postedDateFilter(job.postedAt)) {
           totalFilteredPostedDate++;
+          skip(job, company.name, 'outside the --posted-after/--posted-before window');
           continue;
         }
         if (!salaryFilter(job.salary)) {
           totalFilteredSalary++;
+          skip(job, company.name, 'salary filter');
           continue;
         }
         if (!contentFilter(job.description, matchedTitleKeywords(job.title, config.title_filter))) {
           totalFilteredContent++;
+          skip(job, company.name, 'description content filter');
           continue;
         }
         if (!countryEligibilityFilter(job.description)) {
           totalFilteredCountryEligibility++;
+          skip(job, company.name, 'country eligibility filter');
           continue;
         }
         if (!visaFilter(job.description)) {
           totalFilteredVisa++;
+          skip(job, company.name, 'visa filter');
           continue;
         }
         const dedupUrl = normalizeUrlForDedup(job.url);
@@ -3259,6 +3333,7 @@ async function main() {
         const cooldownResult = cooldownFilter(job);
         if (cooldownResult.skip) {
           totalFilteredCooldown++;
+          skip(job, company.name, `re-apply cooldown (${cooldownResult.reason})`);
           cooldownOffers.push({
             job: { ...job, source: sourceName },
             status: cooldownResult.reason,
@@ -3285,6 +3360,7 @@ async function main() {
           careersUrlDomain,
         });
       }
+      if (!dryRun) recordSourceScan(company.name, sourceStartedAt, sourceSinceMs, jobs.length);
     } catch (err) {
       errors.push({
         company: company.name,
@@ -3373,6 +3449,22 @@ async function main() {
     }
     for (const [status, group] of byStatus) {
       await appendToScanHistory(group, date, status);
+    }
+  }
+
+  // Skipped-roles log — one text file per day, appended across runs and
+  // deduplicated so re-scanning the same boards doesn't repeat lines.
+  if (!dryRun && skippedRoles.length > 0) {
+    try {
+      const skippedDir = path.join(DATA_ROOT, 'Skipped');
+      const skippedFile = path.join(skippedDir, `${date}.txt`);
+      mkdirSync(skippedDir, { recursive: true });
+      const have = new Set(existsSync(skippedFile) ? readFileSync(skippedFile, 'utf-8').split('\n') : []);
+      const fresh = [...new Set(skippedRoles)].filter((l) => !have.has(l));
+      if (fresh.length > 0) appendFileSync(skippedFile, fresh.join('\n') + '\n', 'utf-8');
+      console.log(`Skipped roles logged:  ${fresh.length} new → Skipped/${date}.txt`);
+    } catch (err) {
+      console.warn(`Skipped-roles log failed: ${err.message}`);
     }
   }
 

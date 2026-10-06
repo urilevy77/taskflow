@@ -92,7 +92,10 @@ export function ExplorerView({
   const enriched: EnrichedOffer[] = useMemo(
     () =>
       offers.map((o) => {
-        const inPipeline = inboxUrls.has(o.url);
+        // Server-side `known` (normalized URL + company/role vs tracker, pipeline and
+        // scan history) is authoritative; the exact-URL and title checks below stay as
+        // a client-side backstop for offers that arrive without it (AI search, "fresh").
+        const inPipeline = inboxUrls.has(o.url) || o.known?.kind === "pipeline" || o.known?.kind === "history";
         const c = norm(o.company);
         const t = norm(o.title);
         const ev = appsSnapshot.find((a) => {
@@ -100,7 +103,7 @@ export function ExplorerView({
           const ar = norm(a.role);
           return ar.length > 3 && (t.includes(ar) || ar.includes(t.split(" ").slice(0, 3).join(" ")));
         });
-        return { ...o, inPipeline, evaluatedN: ev?.n };
+        return { ...o, inPipeline, evaluatedN: ev?.n ?? (o.known?.kind === "tracker" ? o.known.trackerNum : undefined) };
       }),
     [offers, inboxUrls, appsSnapshot],
   );

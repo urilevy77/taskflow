@@ -4,7 +4,7 @@ import { useMemo, useState } from "react";
 import { ExternalLink, Plus, Check, Loader2, ShieldQuestion, Sparkles, Coins } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { instrumentSerif } from "@/lib/fonts";
-import { ATS_LABEL, type AtsSource, type DiscoveredOffer } from "@/lib/explore";
+import { ATS_LABEL, type AtsSource, type DiscoveredOffer, type KnownMatch } from "@/lib/explore";
 import { useJobs } from "@/components/jobs/job-store";
 import { useExplore } from "./explore-provider";
 
@@ -12,6 +12,12 @@ function freshness(postedAt: string): string {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(postedAt)) return "";
   const days = Math.max(0, Math.round((Date.now() - new Date(postedAt + "T00:00:00Z").getTime()) / 86_400_000));
   return days === 0 ? "today" : days === 1 ? "1d ago" : `${days}d ago`;
+}
+
+function knownLabel(k: KnownMatch): string {
+  if (k.kind === "tracker") return `Already tracked${k.trackerNum ? ` #${k.trackerNum}` : ""}${k.status ? ` · ${k.status}` : ""}`;
+  if (k.kind === "pipeline") return "Already in pipeline";
+  return `Seen before${k.since ? ` · ${k.since}` : ""}`;
 }
 
 // Real company logo (favicon) via the localhost proxy, cached on disk FOREVER per
@@ -88,6 +94,14 @@ export function DiscoveryCard({ offer, inPipeline, evaluatedN }: { offer: Discov
       <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
         <span className="rounded border border-border px-1.5 py-0.5 font-medium text-muted">{ATS_LABEL[offer.ats as AtsSource] ?? offer.ats}</span>
         {fresh && <span className="text-faint">{fresh}</span>}
+        {offer.known && (
+          <span
+            className="inline-flex items-center gap-1 rounded border border-emerald-500/25 bg-emerald-500/10 px-1.5 py-0.5 font-medium text-emerald-600 dark:text-emerald-400"
+            title={`Matched by ${offer.known.reason === "url" ? "posting URL" : "company + role"}: “${offer.known.label}”`}
+          >
+            <Check className="size-3" /> {knownLabel(offer.known)}
+          </span>
+        )}
         {unverified && (
           <span
             className="inline-flex items-center gap-1 rounded border border-amber-500/25 bg-amber-500/10 px-1.5 py-0.5 font-medium text-amber-600 dark:text-amber-300"

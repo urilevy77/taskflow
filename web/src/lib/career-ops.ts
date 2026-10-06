@@ -4,6 +4,7 @@ import * as yaml from "js-yaml";
 import { atomicWrite } from "@/lib/core/safe-write";
 import { resolveDataRoot } from "@/lib/core/data-root.mjs";
 import { parseApplications } from "@/lib/tracker-table.mjs";
+import { buildProviderResolver } from "@/lib/core/job-source.mjs";
 // One definition of the `{n}-RESERVED.md` convention, shared with
 // run-cli-support.mjs — see report-files.mjs for why it lives there.
 import { isReservedReportFile } from "@/lib/report-files.mjs";
@@ -159,6 +160,10 @@ export type Application = {
   pdf: string;
   report: string;
   notes: string;
+  /** posting URL (tracker `URL` column); "" when the row has none */
+  url?: string;
+  /** where the posting came from — WhatsApp, a scanned ATS, a sheet… (derived, see core/job-source.ts) */
+  provider?: string;
 };
 
 /**
@@ -298,6 +303,12 @@ export type PipelineSummary = {
   applications: Application[];
 };
 
+/** Attach `provider` (where the posting came from) to each tracker row that has a URL. */
+function withProviders(apps: Application[]): Application[] {
+  const providerOf = buildProviderResolver({ historyTsv: read("data/scan-history.tsv"), pipelineMd: read("data/pipeline.md") });
+  return apps.map((a) => ({ ...a, provider: a.url ? providerOf(a.url) : "" }));
+}
+
 export function pipelineSummary(): PipelineSummary {
   const root = careerOpsRoot();
   const scanDates = readScanDates();
@@ -307,7 +318,7 @@ export function pipelineSummary(): PipelineSummary {
     // join the freshness date (first_seen) onto each raw posting — the inbox's
     // triage view orders/faceted-filters on it entirely client-side.
     inbox: readInbox().map((j) => ({ ...j, postedAt: j.postedAt ?? scanDates.get(j.url) })),
-    applications: readApplications(),
+    applications: withProviders(readApplications()),
   };
 }
 

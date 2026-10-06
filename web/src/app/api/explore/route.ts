@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import fs from "node:fs";
 import { runDiscovery } from "@/lib/core/scan";
+import { annotateKnown, loadKnownIndex } from "@/lib/core/known-jobs";
 import { rootScript } from "@/lib/career-ops";
 import { parseExplorePatch, DEFAULT_FILTERS, type DiscoveredOffer, type ScanEvent } from "@/lib/explore";
 import { scannerMissingBody, SCANNER_MISSING_STATUS } from "@/lib/explore-error.mjs";
@@ -41,7 +42,13 @@ export async function POST(req: NextRequest) {
       send({ kind: "start", ats: filters.ats, sinceDays: filters.sinceDays, limit: filters.limitPerAts, free: true } satisfies ScanEvent);
       let offers: DiscoveredOffer[] = [];
       try {
-        offers = await runDiscovery(filters, (e: ScanEvent) => send(e));
+        // Snapshot what we already have ONCE, then tag every offer as it streams out.
+        // A failure here must never cost the user their scan — fall back to untagged.
+        const known = await loadKnownIndex().catch(() => null);
+        offers = await runDiscovery(filters, (e: ScanEvent) =>
+          send(known && e.kind === "offer" ? { ...e, offer: annotateKnown(known, [e.offer])[0] } : e),
+        );
+        if (known) offers = annotateKnown(known, offers);
       } catch (err) {
         send({ kind: "error", message: err instanceof Error ? err.message : "discovery failed" } satisfies ScanEvent);
       }

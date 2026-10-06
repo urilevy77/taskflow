@@ -173,9 +173,31 @@ export function detectCli(candidates = CLI_CANDIDATES, probe = defaultProbe) {
   return null;
 }
 
+/**
+ * On Windows, execFileSync cannot launch npm's `.cmd` shims (ENOENT without a
+ * shell, and a shell would mangle the prompt argument). Resolve the shim to the
+ * real executable it wraps; on other platforms, or when nothing resolves, the
+ * bare name is returned unchanged.
+ */
+export function resolveBin(bin) {
+  if (process.platform !== 'win32') return bin;
+  const dirs = (process.env.PATH ?? process.env.Path ?? '').split(';').filter(Boolean);
+  for (const dir of dirs) {
+    if (existsSync(join(dir, `${bin}.exe`))) return join(dir, `${bin}.exe`);
+    const shim = join(dir, `${bin}.cmd`);
+    if (!existsSync(shim)) continue;
+    const m = readFileSync(shim, 'utf-8').match(/"%dp0%\\?([^"]+?\.exe)"/i);
+    if (m) {
+      const exe = join(dir, m[1]);
+      if (existsSync(exe)) return exe;
+    }
+  }
+  return bin;
+}
+
 function defaultProbe(bin) {
   try {
-    execFileSync(bin, ['--version'], { stdio: 'ignore', timeout: 3000 });
+    execFileSync(resolveBin(bin), ['--version'], { stdio: 'ignore', timeout: 10000 });
     return true;
   } catch {
     return false;
@@ -237,7 +259,7 @@ function callCli(cli, prompt, model) {
   if (model && cli.bin !== 'codex' && cli.bin !== 'opencode') args.push('--model', model);
   // Explicit maxBuffer: a verbose response otherwise throws
   // ERR_CHILD_PROCESS_STDIO_MAXBUFFER and fails the batch for no good reason.
-  return execFileSync(cli.bin, args, {
+  return execFileSync(resolveBin(cli.bin), args, {
     encoding: 'utf-8',
     maxBuffer: 10 * 1024 * 1024,
     timeout: 120_000,

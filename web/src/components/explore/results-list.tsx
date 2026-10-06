@@ -26,7 +26,8 @@ export function ResultsList({ offers }: { offers: EnrichedOffer[] }) {
     return sorted;
   }, [offers, q, sort]);
 
-  const addable = offers.filter((o) => !o.inPipeline && !o.evaluatedN && !added.has(o.url));
+  const addable = offers.filter((o) => !o.known && !o.inPipeline && !o.evaluatedN && !added.has(o.url));
+  const knownCount = offers.filter((o) => o.known).length;
 
   return (
     <div className="space-y-4">
@@ -39,7 +40,7 @@ export function ResultsList({ offers }: { offers: EnrichedOffer[] }) {
           <p className="text-[12px] text-faint">
             {isAi
               ? "found by AI on the open web · unverified until you evaluate"
-              : `${companiesScanned > 0 ? `${companiesScanned.toLocaleString()} companies scanned · ` : ""}0 tokens spent${partial ? " · some boards were unreachable (normal for public directories)" : ""}`}
+              : `${companiesScanned > 0 ? `${companiesScanned.toLocaleString()} companies scanned · ` : ""}${knownCount > 0 ? `${knownCount} already in your tracker/pipeline · ` : ""}0 tokens spent${partial ? " · some boards were unreachable (normal for public directories)" : ""}`}
           </p>
         </div>
 

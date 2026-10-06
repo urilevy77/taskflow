@@ -4,6 +4,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { careerOpsRoot, rootScript } from "@/lib/career-ops";
 import type { DiscoveredOffer } from "./scan";
+import { loadKnownIndex } from "./known-jobs";
 
 /**
  * "Add to pipeline" — appends user-selected discovered offers to data/pipeline.md
@@ -17,9 +18,24 @@ import type { DiscoveredOffer } from "./scan";
  * Discovered-but-not-added offers stay "new" (a dry-run scan writes nothing);
  * only an explicit add records them as seen. No tokens are spent here.
  */
-export type AddResult = { added: number; error?: string };
+export type AddResult = { added: number; skipped?: number; error?: string };
 
-export function addOffersToPipeline(offers: DiscoveredOffer[]): Promise<AddResult> {
+export async function addOffersToPipeline(offers: DiscoveredOffer[]): Promise<AddResult> {
+  // Server-side guard: a stale results list (or a second tab) must not re-add a job
+  // that is already in the tracker, pipeline or scan history. Fail open — an index
+  // error must never block an explicit add.
+  let skipped = 0;
+  const index = await loadKnownIndex().catch(() => null);
+  if (index) {
+    const fresh = offers.filter((o) => !(o && typeof o.url === "string" && index.classify(o)));
+    skipped = offers.length - fresh.length;
+    offers = fresh;
+  }
+  const result = await appendOffers(offers);
+  return skipped ? { ...result, skipped } : result;
+}
+
+function appendOffers(offers: DiscoveredOffer[]): Promise<AddResult> {
   const clean = offers
     .filter((o) => o && typeof o.url === "string" && /^https?:\/\//i.test(o.url))
     .map((o) => ({

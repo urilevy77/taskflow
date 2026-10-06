@@ -204,3 +204,12 @@ documents/*
 # Intake fingerprints — the recorded source filenames may themselves carry
 # PII (e.g. cv/jane-doe-master-cv.pdf). #1723
 data/intake-state.json
+
+# Role-folder CV library (autopilot/cv-library.mjs) — personal CV PDFs
+CVs/
+
+# Roles rejected by scan filters (personal job-search log)
+Skipped/
+
+# Personal application-form answers (PII)
+application-details/

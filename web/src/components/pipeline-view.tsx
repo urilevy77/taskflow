@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { Search, ChevronsUpDown, X, Compass, ArrowRight } from "lucide-react";
+import { Search, ChevronsUpDown, X, Compass, ArrowRight, ExternalLink } from "lucide-react";
 import type { Application, InboxJob } from "@/lib/career-ops";
 import { Badge } from "@/components/ui/badge";
 import { CompanyLogo } from "@/components/company-logo";
@@ -28,7 +28,7 @@ const TABS = [
 ] as const;
 type Tab = (typeof TABS)[number];
 
-const SORT_KEYS = ["company", "role", "score", "status", "date"] as const;
+const SORT_KEYS = ["company", "role", "score", "status", "date", "provider"] as const;
 type SortKey = (typeof SORT_KEYS)[number];
 
 export function PipelineView({
@@ -200,7 +200,7 @@ export function PipelineView({
            of being silently cut off. min-w keeps the columns readable rather
            than letting w-full crush them on a phone. */
         <div className="mt-4 overflow-x-auto rounded-2xl border border-border">
-          <table className="w-full min-w-[44rem] text-sm">
+          <table className="w-full min-w-[58rem] text-sm">
             <thead className="bg-surface/60 text-left text-xs uppercase tracking-wide text-faint">
               <tr>
                 {SORT_KEYS.map((k) => (
@@ -215,6 +215,7 @@ export function PipelineView({
                     </span>
                   </th>
                 ))}
+                <th className="whitespace-nowrap px-4 py-2.5 font-medium">URL</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border">
@@ -241,6 +242,23 @@ export function PipelineView({
                     </span>
                   </td>
                   <td className="whitespace-nowrap px-4 py-3 text-faint tabular-nums">{r.date}</td>
+                  <td className="whitespace-nowrap px-4 py-3 text-muted">{r.provider || "—"}</td>
+                  <td className="px-4 py-3">
+                    {r.url ? (
+                      <a
+                        href={r.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        title={r.url}
+                        className="inline-flex max-w-[14rem] items-center gap-1 truncate text-brand hover:underline"
+                      >
+                        {r.url.replace(/^https?:\/\/(www\.)?/, "")}
+                        <ExternalLink className="size-3 shrink-0" />
+                      </a>
+                    ) : (
+                      <span className="text-faint">—</span>
+                    )}
+                  </td>
                   </tr>
                 );
               })}
