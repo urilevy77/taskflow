@@ -76,16 +76,56 @@ export function siteUrl(env = process.env) {
   return env.AUTOPILOT_SITE_PROJECT ? `https://${env.AUTOPILOT_SITE_PROJECT}.pages.dev` : '';
 }
 
-function deploy(dir, project) {
+/** Pure: does this unauthenticated response come from Cloudflare Access (i.e. the site is behind a login)? */
+export function isAccessResponse(status, location) {
+  return status >= 300 && status < 400 && /\.cloudflareaccess\.com\//i.test(String(location ?? ''));
+}
+
+/** Asks the live site, logged out. true = protected by Access; false = open (or unreachable). */
+export async function siteIsProtected(url) {
+  try {
+    const res = await fetch(`${url}/`, { redirect: 'manual', signal: AbortSignal.timeout(15000) });
+    return isAccessResponse(res.status, res.headers.get('location'));
+  } catch { return false; }
+}
+
+/** Pages project names: lowercase letters, digits, dashes. Also keeps .env input out of the shell line below. */
+export const validProject = (p) => /^[a-z0-9][a-z0-9-]{0,57}$/.test(String(p ?? ''));
+
+function wrangler(args) {
   return new Promise((resolve) => {
-    const child = spawn('npx', ['--yes', 'wrangler@4', 'pages', 'deploy', dir, '--project-name', project, '--branch', 'main', '--commit-dirty=true'],
-      { cwd: ROOT, shell: process.platform === 'win32', env: process.env });
+    // One quoted command line (npx is a .cmd on Windows and needs a shell); every arg is ours or validated.
+    const line = ['npx', '--yes', 'wrangler@4', ...args].map((a) => (/^[\w@.:=\\/-]+$/.test(a) ? a : `"${a}"`)).join(' ');
+    const child = spawn(line, { cwd: ROOT, shell: true, env: process.env });
     let out = '';
     child.stdout.on('data', (d) => { out += d; });
     child.stderr.on('data', (d) => { out += d; });
     child.on('close', (code) => resolve({ code, out }));
     child.on('error', (err) => resolve({ code: 1, out: String(err) }));
   });
+}
+
+/** Setup checklist: which steps are done. Prints one line per step. */
+export async function checkSetup() {
+  dotenv.config({ path: join(ROOT, '.env'), quiet: true });
+  const project = process.env.AUTOPILOT_SITE_PROJECT;
+  const who = await wrangler(['whoami']);
+  const loggedIn = who.code === 0 && !/not authenticated/i.test(who.out);
+  const projects = loggedIn ? await wrangler(['pages', 'project', 'list']) : { code: 1, out: '' };
+  const url = siteUrl();
+  const rows = [
+    ['Cloudflare login (npx wrangler login)', loggedIn || Boolean(process.env.CLOUDFLARE_API_TOKEN)],
+    ['AUTOPILOT_SITE_PROJECT set in .env', Boolean(project)],
+    ['Pages project exists', Boolean(project) && projects.code === 0 && projects.out.includes(project)],
+    ['Cloudflare Access protects the site', Boolean(url) && await siteIsProtected(url)],
+  ];
+  for (const [name, ok] of rows) console.log(`${ok ? '✓' : '✗'} ${name}`);
+  if (url) console.log(`\nsite: ${url}`);
+  return rows.every(([, ok]) => ok);
+}
+
+function deploy(dir, project) {
+  return wrangler(['pages', 'deploy', dir, '--project-name', project, '--branch', 'main', '--commit-dirty=true']);
 }
 
 /** Build + upload. Returns a short status line; never throws. */
@@ -95,6 +135,9 @@ export async function publishSite() {
     const { dir, pages } = buildSite();
     const project = process.env.AUTOPILOT_SITE_PROJECT;
     if (!project) return `site built (${pages} page(s)), upload skipped — AUTOPILOT_SITE_PROJECT not set in .env`;
+    if (!validProject(project)) return `site upload skipped — AUTOPILOT_SITE_PROJECT must be lowercase letters, digits and dashes`;
+    // The pages hold the job pipeline: never upload to a site anyone can open.
+    if (!(await siteIsProtected(siteUrl()))) return `site upload REFUSED: ${siteUrl()} is not behind Cloudflare Access — add the Access application first (node autopilot/publish-site.mjs --check)`;
     const { code, out } = await deploy(dir, project);
     if (code !== 0) return `site upload FAILED: ${out.trim().split(/\r?\n/).slice(-3).join(' | ').slice(0, 300)}`;
     return `site published: ${siteUrl()} (${pages} run page(s))`;
@@ -110,12 +153,17 @@ function selfTest() {
   check('siteUrl override wins, trailing slash dropped', siteUrl({ AUTOPILOT_SITE_PROJECT: 'x', AUTOPILOT_SITE_URL: 'https://jobs.example/' }) === 'https://jobs.example');
   check('siteUrl empty when unset', siteUrl({}) === '');
   check('headers keep it out of search + caches', SITE_HEADERS.includes('noindex') && SITE_HEADERS.includes('no-store'));
+  check('Access login redirect = protected', isAccessResponse(302, 'https://uri.cloudflareaccess.com/cdn-cgi/access/login/x.pages.dev?kid=1'));
+  check('open site = not protected', !isAccessResponse(200, null) && !isAccessResponse(302, 'https://x.pages.dev/run'));
+  check('project name validation', validProject('uri-autopilot') && !validProject('a & del x') && !validProject('Upper') && !validProject(''));
+  check('look-alike host is not Access', !isAccessResponse(302, 'https://cloudflareaccess.com.evil.io/'));
   if (failures) process.exitCode = 1; else console.log('\nAll self-tests passed.');
 }
 
 if (isMainModule(import.meta.url)) {
   const argv = process.argv.slice(2);
   if (argv.includes('--self-test')) selfTest();
+  else if (argv.includes('--check')) process.exitCode = (await checkSetup()) ? 0 : 1;
   else if (argv.includes('--build-only')) { const r = buildSite(); console.log(`built ${r.pages} page(s) in ${r.dir}`); }
   else console.log(await publishSite());
 }
