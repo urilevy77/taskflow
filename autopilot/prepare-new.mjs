@@ -31,6 +31,7 @@ import { isMainModule } from '../lib/is-main-module.mjs';
 import { normalizeUrl } from '../url-key.mjs';
 import { slugifySegment } from '../application-artifacts.mjs';
 import { prepare, selectPassRows, findExistingBundle } from './prepare.mjs';
+import { MAX_YEARS } from './experience.mjs';
 
 const ROOT = getCareerOpsRoot();
 const SEEN_PATH = join(ROOT, 'data', 'prepare-seen.json');
@@ -40,10 +41,10 @@ const ADDITIONS_DIR = join(ROOT, 'batch', 'tracker-additions');
 export const DEFAULT_CAP = 15;
 export const MAX_ATTEMPTS = 3;
 
-// The candidate has ~15 months of experience. A *required* 2+ years, or an unmarked / required
-// 3+ years, is a knock-out worth a human look. "Preferred" asks stay informational.
+// Junior-only policy (autopilot/experience.mjs): any ask above MAX_YEARS, required or preferred, is a
+// knock-out. prepare.mjs already stops these; this keeps a result built elsewhere from reading READY.
 export function experienceKnockout(asks) {
-  return (asks ?? []).find((a) => (a.strength === 'required' && a.years >= 2) || (a.strength !== 'preferred' && a.years >= 3)) ?? null;
+  return (asks ?? []).find((a) => a.years > MAX_YEARS) ?? null;
 }
 
 /**
@@ -217,8 +218,8 @@ function selfTest() {
   check('closed posting is BLOCKED', classifyReadiness({ ok: false, error: 'posting is closed: expired' }).label === 'BLOCKED');
   check('preflight stop is BLOCKED', classifyReadiness(ok({ preflight: { stops: ['already in the tracker as #5'], warnings: [] } })).label === 'BLOCKED');
   check('required 4+ years is CHECK', classifyReadiness(ok({ asks: [{ years: 4, strength: 'required', snippet: '4+ years' }] })).label === 'CHECK');
-  check('required 2 years is CHECK', classifyReadiness(ok({ asks: [{ years: 2, strength: 'required', snippet: '2 years' }] })).label === 'CHECK');
-  check('preferred 5 years stays READY', classifyReadiness(ok({ asks: [{ years: 5, strength: 'preferred', snippet: 'x' }] })).label === 'READY');
+  check('required 2 years is READY (max 2)', classifyReadiness(ok({ asks: [{ years: 2, strength: 'required', snippet: '2 years' }] })).label === 'READY');
+  check('preferred 5 years is CHECK', classifyReadiness(ok({ asks: [{ years: 5, strength: 'preferred', snippet: 'x' }] })).label === 'CHECK');
   check('unmarked 1-2 years stays READY', classifyReadiness(ok({ asks: [{ years: 2, strength: 'unmarked', snippet: 'x' }] })).label === 'READY');
   check('unmarked 3 years is CHECK', classifyReadiness(ok({ asks: [{ years: 3, strength: 'unmarked', snippet: 'x' }] })).label === 'CHECK');
   check('account wall is CHECK', classifyReadiness(ok({ preflight: { stops: [], warnings: [], accountWall: 'Workday' } })).label === 'CHECK');

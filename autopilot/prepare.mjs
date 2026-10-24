@@ -43,6 +43,7 @@ import { reserveReportNumbers, releaseReportNumbers, formatReportNumber } from '
 import { applicationArtifactPaths, ensureApplicationArtifactDirs, slugifySegment } from '../application-artifacts.mjs';
 import { resolveTrackerPath } from '../path-resolver.mjs';
 import { classifyLane } from './triage-run.mjs';
+import { experienceAsks, MAX_YEARS } from './experience.mjs';
 
 const ROOT = getCareerOpsRoot();
 const FETCH_TIMEOUT_MS = 20_000;
@@ -267,29 +268,17 @@ export function blacklistHit(text, company) {
   return null;
 }
 
-/**
- * Years-of-experience asks in the JD, quoted with their strength marker. The
- * triage reason can miss these (Ib1 PASSed at 3.8 over a "4+ years … Required"
- * line), and for an early-career CV they are the likeliest knock-out, so gate 1
- * shows them verbatim rather than leaving them buried in the JD text.
- */
-export function experienceAsks(jdText) {
-  const out = [];
-  const rx = /(\d{1,2})\s*(?:\+|-\s*\d{1,2})?\s*(?:\+\s*)?years?\b[^.\n]{0,160}/gi;
-  for (const m of String(jdText ?? '').matchAll(rx)) {
-    const snippet = m[0].trim();
-    if (!/experience|hands-on|background|building|developing|working/i.test(snippet)) continue;
-    const strength = /required|a must|must have|minimum|at least/i.test(snippet) ? 'required' : /preferred|advantage|nice to have|plus\b/i.test(snippet) ? 'preferred' : 'unmarked';
-    out.push({ years: Number(m[1]), strength, snippet: snippet.slice(0, 140) });
-  }
-  return out;
-}
+export { experienceAsks };
 
 function preflight(row, jdText = '') {
   const stops = [], warnings = [], notes = [];
 
+  // Junior-only policy (autopilot/experience.mjs): an ask above MAX_YEARS stops the job, any other is shown.
   for (const ask of experienceAsks(jdText)) {
-    warnings.push(`JD asks ${ask.years}+ years (${ask.strength}): "${ask.snippet}"`);
+    const line = `JD asks ${ask.years}+ years (${ask.strength}): "${ask.snippet}"`;
+    // A job you moved to PASS yourself from the Filtered page is your call — shown, not stopped.
+    if (ask.years > MAX_YEARS && !/moved to PASS by you/.test(row.triage?.reason ?? '')) stops.push(`${line} — over your ${MAX_YEARS}-year limit`);
+    else warnings.push(line);
   }
 
   const blPath = join(ROOT, 'data', 'blacklist.md');

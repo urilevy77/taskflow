@@ -54,6 +54,7 @@ import { TRIAGE_CLI_CANDIDATES } from './triage-run.mjs';
 import { appendRunLog } from './run-log.mjs';
 import { sendRunReport } from './notify-mail.mjs';
 import { publishSite } from './publish-site.mjs';
+import { MAX_YEARS } from './experience.mjs';
 
 const ROOT = getCareerOpsRoot();
 const DB_PATH = join(ROOT, 'data', 'careerops.db');
@@ -76,6 +77,7 @@ const TRIAGE_STAGE_TIMEOUT_MS = 40 * 60_000; // 60 rows × ~20-30s; bounded by -
 const ENRICH_STAGE_TIMEOUT_MS = 15 * 60_000; // plain HTTP at 250ms spacing; ~200 rows fits comfortably
 const PREPARE_STAGE_TIMEOUT_MS = 30 * 60_000; // up to 15 jobs, each a JD fetch + liveness check (zero tokens)
 const TAILOR_STAGE_TIMEOUT_MS = 30 * 60_000; // ≤3 LLM tailors (~1-3 min each incl. PDF render) + free reuses
+const EXP_GATE_TIMEOUT_MS = 20 * 60_000; // ≤200 plain JD fetches at 0.25-1s spacing, 10s timeout each
 const SHORT_TIMEOUT_MS = 60_000; // also the ceiling for dedup-intake (pure file work)
 
 const USAGE = `
@@ -90,6 +92,7 @@ const USAGE = `
     --skip-goozali      don't run goozali-sync.mjs even on a Monday
     --goozali-apply     let goozali-sync.mjs write portals.yml (default: report-only)
     --skip-scan         don't run scan-all.mjs
+    --skip-exp-gate     don't run experience-gate.mjs (the ≤2-years filter)
     --skip-triage       don't run triage-run.mjs
     --skip-prepare      don't run prepare-new.mjs (JD archive + READY/CHECK/BLOCKED for new PASS jobs)
     --skip-tailor       don't run auto-tailor.mjs (CVs for READY jobs: CVs/ library first, ≤5 jobs, ≤3 LLM calls)
@@ -278,6 +281,11 @@ async function stageDedup() {
   return out.trim().split(/\r?\n/).filter(Boolean).pop() || 'dedup-intake.mjs completed';
 }
 
+async function stageExpGate() {
+  const out = await runNode(join(ROOT, 'autopilot', 'experience-gate.mjs'), [], EXP_GATE_TIMEOUT_MS);
+  return out.trim().split(/\r?\n/).filter(Boolean).pop() || 'experience-gate.mjs completed';
+}
+
 async function stageTriage(budget, cli, model) {
   const args = ['--budget', String(budget)];
   if (cli) args.push('--cli', cli);
@@ -399,6 +407,7 @@ async function main(argv) {
   const skipEnrich = hasFlag(argv, '--skip-enrich');
   const skipTriage = hasFlag(argv, '--skip-triage');
   const skipDedup = hasFlag(argv, '--skip-dedup');
+  const skipExpGate = hasFlag(argv, '--skip-exp-gate');
   const skipPrepare = hasFlag(argv, '--skip-prepare');
   const skipTailor = hasFlag(argv, '--skip-tailor');
   // No default cap: enrichment is zero-token plain HTTP, so the useful default
@@ -417,6 +426,7 @@ async function main(argv) {
     { name: 'scan', run: !skipScan, detail: skipScan ? 'skipped (--skip-scan)' : 'scan-all.mjs (WhatsApp + boards)' },
     { name: 'enrich', run: !skipEnrich, detail: skipEnrich ? 'skipped (--skip-enrich)' : `enrich-leads.mjs --write${budgetEnrich ? ` --limit ${budgetEnrich}` : ' (all bare rows)'}` },
     { name: 'dedup', run: !skipDedup, detail: skipDedup ? 'skipped (--skip-dedup)' : 'dedup-intake.mjs --write — same job from two sources → dup-of, never triaged (free)' },
+    { name: 'exp-gate', run: !skipExpGate, detail: skipExpGate ? 'skipped (--skip-exp-gate)' : `experience-gate.mjs — reads each new job's description, drops the ones asking more than ${MAX_YEARS} years (free)` },
     { name: 'triage', run: !skipTriage, detail: skipTriage ? 'skipped (--skip-triage)' : `budget ${budgetTriage}` },
     { name: 'prepare', run: !skipPrepare, detail: skipPrepare ? 'skipped (--skip-prepare)' : 'prepare-new.mjs — JD + preflight + tracker row for new PASS jobs (free, max 15)' },
     { name: 'tailor', run: !skipTailor, detail: skipTailor ? 'skipped (--skip-tailor)' : 'auto-tailor.mjs — CVs for READY jobs: CVs/ library first, max 5 jobs, max 3 LLM calls' },
@@ -458,6 +468,13 @@ async function main(argv) {
     stages.push(await runStage('dedup', () => stageDedup()));
   } else {
     stages.push(buildStageResult('dedup', true, 'skipped (--skip-dedup)', 0));
+  }
+
+  // Junior-only: jobs asking more than MAX_YEARS years are closed here, before triage spends tokens on them.
+  if (!skipExpGate) {
+    stages.push(await runStage('exp-gate', () => stageExpGate()));
+  } else {
+    stages.push(buildStageResult('exp-gate', true, 'skipped (--skip-exp-gate)', 0));
   }
 
   if (!skipTriage) {
