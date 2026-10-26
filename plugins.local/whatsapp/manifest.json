@@ -1,0 +1,13 @@
+{
+  "id": "whatsapp",
+  "name": "WhatsApp group ingest",
+  "version": "0.1.0",
+  "apiVersion": 1,
+  "description": "Pull job links shared in your own WhatsApp groups into the pipeline (read-only, local session).",
+  "hooks": ["ingest"],
+  "requiredEnv": [],
+  "optionalEnv": [],
+  "allowedHosts": [],
+  "skill": "skill.md",
+  "humanInTheLoop": true
+}

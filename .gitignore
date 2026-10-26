@@ -77,8 +77,13 @@ voice-dna.md
 
 # Plugin layer — opt-in toggles + user-installed plugins + integrity lock (never auto-updated)
 config/plugins.yml
-plugins.local/
+plugins.local/*
+# The WhatsApp ingest plugin ships with this fork (no personal data in it — the
+# group list lives in config/plugins.yml, the session in data/whatsapp-session/).
+!plugins.local/whatsapp/
 plugins.lock
+# whatsapp-web.js's WhatsApp Web build cache
+.wwebjs_cache/
 
 # Secrets (never commit — use .env.example as template)
 .env

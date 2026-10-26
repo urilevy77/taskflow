@@ -33,3 +33,14 @@ plugins:
     enabled: false
     # label: "Job Leads"     # the Gmail label to scan
     # days_back: 7           # how far back to look
+
+  # ── whatsapp (plugins.local, ingest) ── job links shared in your own WhatsApp groups.
+  # No key. Enable with `node plugins.mjs enable whatsapp --confirm`, pair once by
+  # scanning a QR code (`npm run whatsapp:watch`), then list your groups with
+  # `node plugins.local/whatsapp/watch.mjs --list-groups` and paste the ones to watch.
+  # The daily scan reads the last few days of these groups and queues job links.
+  whatsapp:
+    enabled: false
+    groups: []
+    #  - { name: "Junior Jobs IL", jid: "1203xxxxxxxxxxxxxx@g.us" }   # jid is exact and preferred
+    #  - "Another Group Name"                                       # bare name also works

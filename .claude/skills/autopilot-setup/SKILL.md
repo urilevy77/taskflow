@@ -61,7 +61,8 @@ Get-ScheduledTask -TaskName "career-ops autopilot daily" -ErrorAction SilentlyCo
 ```
 
 Checklist items: Node + dependencies · CV · profile · portals/title filter ·
-experience limit · `.env` + email · first manual run · phone site (optional) ·
+experience limit · `.env` + email · first manual run · WhatsApp groups
+(optional — `config/plugins.yml` has `whatsapp.enabled: true` and groups) · phone site (optional) ·
 phone taps sync (optional) · daily schedule.
 
 ## Phase 1 — Install
@@ -118,11 +119,38 @@ node autopilot/daily.mjs --skip-triage      # real run, zero LLM cost; can take 
 
 Afterwards, show them how many jobs were found and `data/pipeline.md`. If
 email is set up, the run mails the report itself; if it didn't arrive, resend
-with `node autopilot/notify-mail.mjs --send-latest` and read the error. If a stage failed, read its error from the run output / `data/runs/`
-and fix it before moving on. Notes:
-- WhatsApp group scanning is a private local plugin that is NOT in this repo;
-  the scan skips it on its own. That's expected — don't try to build it.
-- Goozali (Israeli tech companies) runs in report-only mode by default.
+with `node autopilot/notify-mail.mjs --send-latest` and read the error. If a
+stage failed, read its error from the run output / `data/runs/` and fix it
+before moving on. Goozali (Israeli tech companies) runs in report-only mode by
+default; WhatsApp is skipped until Phase 4b turns it on.
+
+## Phase 4b — WhatsApp job groups (optional, free)
+
+Many job links are shared in WhatsApp groups. The autopilot can read the
+groups the person picks and add the job links to the daily scan. Explain:
+it links like WhatsApp Web (a "linked device" on their phone), only READS the
+groups they list, never sends anything, and the login stays on this PC in
+`data/whatsapp-session/`. It uses `whatsapp-web.js`, an unofficial library —
+fine for reading your own groups, never for bulk messaging. Ask if they want it.
+
+1. Create `config/plugins.yml` if missing
+   (`cp config/plugins.example.yml config/plugins.yml`), then turn the plugin
+   on: `node plugins.mjs enable whatsapp --confirm`.
+2. **They run this themselves**, because they must scan a QR code with their
+   phone — suggest typing it with the `!` prefix:
+   `! node plugins.local/whatsapp/watch.mjs --list-groups`
+   On the phone: WhatsApp → Settings → Linked Devices → Link a Device → scan.
+   The first load can take a few minutes on a big account. It then prints
+   every group as a line like `- { name: "...", jid: "...@g.us" }`.
+3. Ask which groups are job groups. Put those lines under
+   `plugins.whatsapp.groups` in `config/plugins.yml` (keep `enabled: true`).
+   Group names are the person's private data — they stay in that gitignored file.
+4. Test: `node plugins.local/whatsapp/watch.mjs --backfill` (reads up to the
+   last 4 days, then exits), then `node plugins.mjs run whatsapp` to move the
+   links into `data/pipeline.md`. From now on the daily run does both.
+5. Tell them: if WhatsApp drops the linked device (phone offline a long time,
+   or they remove it), the daily run shows the WhatsApp stage failing — they
+   re-pair by running step 2 again.
 
 ## Phase 5 — Phone site (optional, free)
 
