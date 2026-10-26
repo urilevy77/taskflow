@@ -17,12 +17,16 @@
 # needs no admin rights for a per-user task):
 #   .\autopilot\install-schedule.ps1                        # register, 17:30 daily, budget 60
 #   .\autopilot\install-schedule.ps1 -Time "08:00" -BudgetTriage 60
+#   .\autopilot\install-schedule.ps1 -SkipTriage             # no LLM triage — zero token cost
+#   .\autopilot\install-schedule.ps1 -SkipExpGate            # no max-years-of-experience filter
 #   .\autopilot\install-schedule.ps1 -Uninstall              # remove the task
 #   .\autopilot\install-schedule.ps1 -DryRun                 # print what would be registered, register nothing
 
 param(
     [string]$Time = "17:30",
     [int]$BudgetTriage = 60,
+    [switch]$SkipTriage,
+    [switch]$SkipExpGate,
     [switch]$Uninstall,
     [switch]$DryRun
 )
@@ -57,7 +61,12 @@ if (-not (Test-Path (Join-Path $RepoRoot "autopilot\daily.mjs"))) {
 }
 
 $ScriptPath = Join-Path $RepoRoot "autopilot\daily.mjs"
-$Arguments = "`"$ScriptPath`" --budget-triage $BudgetTriage"
+if ($SkipTriage) {
+    $Arguments = "`"$ScriptPath`" --skip-triage"
+} else {
+    $Arguments = "`"$ScriptPath`" --budget-triage $BudgetTriage"
+}
+if ($SkipExpGate) { $Arguments += " --skip-exp-gate" }
 
 Write-Output "Task name:      $TaskName"
 Write-Output "Node:           $NodePath"
@@ -99,7 +108,11 @@ Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Se
 
 Write-Output "`nRegistered. Verify any time with:"
 Write-Output "  Get-ScheduledTask -TaskName `"$TaskName`" | Get-ScheduledTaskInfo"
-Write-Output "Run it once right now (real cost — triages up to $BudgetTriage rows) with:"
+if ($SkipTriage) {
+    Write-Output "Run it once right now (triage off — no LLM calls) with:"
+} else {
+    Write-Output "Run it once right now (real cost — triages up to $BudgetTriage rows) with:"
+}
 Write-Output "  Start-ScheduledTask -TaskName `"$TaskName`""
 Write-Output "Remove it with:"
 Write-Output "  .\autopilot\install-schedule.ps1 -Uninstall"
