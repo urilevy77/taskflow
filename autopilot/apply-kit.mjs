@@ -10,10 +10,12 @@
 //
 //   node autopilot/apply-kit.mjs --self-test
 
-import { readdirSync, existsSync } from 'node:fs';
+import { readdirSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getCareerOpsRoot } from '../path-resolver.mjs';
 import { isMainModule } from '../lib/is-main-module.mjs';
+import { cvSource, describeCvSource } from './cv-library.mjs';
+import { sourceIndex, describeSource, fitSentence } from './job-origin.mjs';
 
 const ROOT = getCareerOpsRoot();
 
@@ -41,16 +43,22 @@ export function findBundleCv(bundle, root = ROOT) {
   return null;
 }
 
-const fileSafe = (s) => String(s ?? '').replace(/[^\p{L}\p{N}]+/gu, '_').replace(/^_+|_+$/g, '').slice(0, 40) || 'job';
-export const cvAttachmentName = (company) => `Uri_Levy_CV_${fileSafe(company)}.pdf`;
+/** The name the CV is sent / downloaded under. Never carries the company: the recruiter sees this name. */
+export const CV_FILENAME = 'Uri_Levy_CV.pdf';
+
+/** The job's one-sentence why: the record's own, else its bundle's state.json (where fit_sentence is kept). */
+function whyOf(rec, root = ROOT) {
+  if (rec.fit_sentence || !rec.bundle) return fitSentence(rec);
+  try { return fitSentence({ ...rec, fit_sentence: JSON.parse(readFileSync(join(root, rec.bundle, 'state.json'), 'utf-8')).fit_sentence }); } catch { return fitSentence(rec); }
+}
 
 const COLORS = { READY: '#1a7f37', CHECK: '#9a6700', BLOCKED: '#8c959f' };
 
-/** One line about the CV: attached (and how it was made), pending, or failed. */
-export function cvLine(rec, cvFile) {
+/** One line about the CV: attached (and where it came from), pending, or failed. `source` = describeCvSource() text. */
+export function cvLine(rec, cvFile, source = '') {
   const c = rec.cv ?? null;
   if (cvFile) {
-    const how = c?.status === 'reused' ? ` · reused from ${esc(c.library ?? 'CVs/')}` : c?.status === 'tailored' ? ' · tailored for this role' : '';
+    const how = source ? ` · ${esc(source)}` : c?.status === 'reused' ? ` · reused from ${esc(c.library ?? 'CVs/')}` : c?.status === 'tailored' ? ' · tailored for this role' : '';
     return `📎 CV attached: <b>${esc(cvFile)}</b>${how}`;
   }
   if (c?.status === 'pending') return `📄 CV pending — ${esc(c.note ?? 'will be made in the next run')}`;
@@ -58,7 +66,7 @@ export function cvLine(rec, cvFile) {
   return '📄 No tailored CV yet for this job';
 }
 
-function card(rec, { cvFile, phoneUrl }) {
+function card(rec, { cvFile, cvFrom, source, phoneUrl }) {
   const url = safeHttpUrl(rec.url);
   const color = COLORS[rec.label] ?? '#555';
   const btn = (href, text, bg) => `<a href="${esc(href)}" style="display:block;text-align:center;padding:14px 10px;margin:8px 0;border-radius:10px;background:${bg};color:#fff;font-weight:700;font-size:17px;text-decoration:none">${esc(text)}</a>`;
@@ -66,10 +74,11 @@ function card(rec, { cvFile, phoneUrl }) {
   return `<div style="border:1px solid #d0d7de;border-left:6px solid ${color};border-radius:10px;padding:12px 14px;margin:14px 0">
 <div style="font-size:12px;font-weight:700;color:${color}">${esc(rec.label)} · ${rec.score != null ? esc(Number(rec.score).toFixed(1)) + '/5' : ''}${rec.location ? ' · ' + esc(rec.location) : ''}</div>
 <div style="font-size:18px;font-weight:700;margin:2px 0">${esc(rec.company)} — ${esc(rec.title)}</div>
-<div style="font-size:14px;color:#444">${esc(rec.triage_reason)}</div>
+<div style="font-size:14px;color:#222"><b>Why:</b> ${esc(whyOf(rec))}</div>
+${source ? `<div style="font-size:12px;color:#666;margin-top:2px">Source: ${esc(source)}</div>` : ''}
 ${(rec.reasons ?? []).map((r) => `<div style="font-size:13px;color:#9a6700;margin-top:4px">⚠ ${esc(r)}</div>`).join('')}
 ${gaps.length ? `<div style="font-size:12px;color:#666;margin-top:4px">Possible gaps: ${esc(gaps.join(', '))}</div>` : ''}
-<div style="font-size:13px;margin-top:6px">${cvLine(rec, cvFile)}</div>
+<div style="font-size:13px;margin-top:6px">${cvLine(rec, cvFile, cvFrom)}</div>
 ${url ? btn(url, 'Apply ›', '#0969da') : '<div style="font-size:13px;color:#8c959f">(no safe link — open from the report)</div>'}
 ${safeHttpUrl(phoneUrl) ? btn(/** @type {string} */ (safeHttpUrl(phoneUrl)), 'I applied / Skip', '#57606a') : ''}
 </div>`;
@@ -77,10 +86,11 @@ ${safeHttpUrl(phoneUrl) ? btn(/** @type {string} */ (safeHttpUrl(phoneUrl)), 'I 
 
 /**
  * @param {Array<Record<string, any>>} records  today's prepared records (prepare-new.mjs)
- * @param {{ phoneUrl?: string, cvSummary?: string, findCv?: (rec: any) => string | null }} [opts]
+ * @param {{ phoneUrl?: string, cvSummary?: string, findCv?: (rec: any) => string | null, sourceOf?: (url: string) => string }} [opts]
  * @returns {{ counts: {READY:number, CHECK:number, BLOCKED:number}, html: string, text: string, attachments: {filename: string, path: string}[] }}
  */
-export function buildApplyKit(records, { phoneUrl = '', cvSummary = '', findCv = (r) => findBundleCv(r.bundle) } = {}) {
+export function buildApplyKit(records, { phoneUrl = '', cvSummary = '', findCv = (r) => findBundleCv(r.bundle), sourceOf } = {}) {
+  if (!sourceOf) { const idx = sourceIndex(ROOT); sourceOf = (url) => describeSource(idx(url)); }
   const counts = { READY: 0, CHECK: 0, BLOCKED: 0 };
   for (const r of records) if (r.label in counts) counts[r.label] += 1;
 
@@ -90,10 +100,12 @@ export function buildApplyKit(records, { phoneUrl = '', cvSummary = '', findCv =
   const textLines = [];
   for (const rec of offered) {
     const pdf = findCv(rec);
-    const cvFile = pdf ? cvAttachmentName(rec.company) : null;
+    const cvFile = pdf ? CV_FILENAME : null;
+    const cvFrom = pdf ? describeCvSource(cvSource(pdf)) : '';
     if (pdf && cvFile) attachments.push({ filename: cvFile, path: pdf });
-    cards.push(card(rec, { cvFile, phoneUrl }));
-    textLines.push(`[${rec.label}] ${rec.company} — ${rec.title} (${rec.score ?? '?'}/5)\n  ${rec.triage_reason}${(rec.reasons ?? []).map((x) => `\n  ! ${x}`).join('')}\n  ${safeHttpUrl(rec.url) ?? '(no safe link)'}${cvFile ? `\n  CV: ${cvFile} (attached)` : ''}`);
+    const source = rec.url ? sourceOf(rec.url) : '';
+    cards.push(card(rec, { cvFile, cvFrom, source, phoneUrl }));
+    textLines.push(`[${rec.label}] ${rec.company} — ${rec.title} (${rec.score ?? '?'}/5)\n  Why: ${whyOf(rec)}${source ? `\n  Source: ${source}` : ''}${(rec.reasons ?? []).map((x) => `\n  ! ${x}`).join('')}\n  ${safeHttpUrl(rec.url) ?? '(no safe link)'}${cvFile ? `\n  CV: ${cvFile} (attached)${cvFrom ? ` — ${cvFrom}` : ''}` : ''}`);
   }
 
   const blocked = records.filter((r) => r.label === 'BLOCKED');
@@ -123,7 +135,7 @@ function selfTest() {
 
   check('summaryFromCv first paragraph', summaryFromCv('# N\n\n## Summary\n\nFirst line\nwraps here.\n\nSecond para.\n\n## Experience\n\nx') === 'First line wraps here.');
   check('summaryFromCv missing section', summaryFromCv('# N\n\n## Experience\n') === '');
-  check('attachment name is file-safe', cvAttachmentName('IAI - Israel <Aerospace>') === 'Uri_Levy_CV_IAI_Israel_Aerospace.pdf');
+  check('CV file name carries no company', CV_FILENAME === 'Uri_Levy_CV.pdf');
 
   const recs = [
     { label: 'READY', company: 'Acme <b>', title: 'Backend Dev', score: 4.2, location: 'Tel Aviv', url: 'https://acme.com/j/1', triage_reason: 'fits', reasons: [], gaps: ['Go'], bundle: 'output/1-acme' },
@@ -132,7 +144,8 @@ function selfTest() {
   ];
   const kit = buildApplyKit(recs, { phoneUrl: 'http://100.1.2.3:3000/?t=abc', cvSummary: 'I build <things>.', findCv: (r) => (r.bundle ? 'C:/x/cv.pdf' : null) });
   check('counts', kit.counts.READY === 1 && kit.counts.CHECK === 1 && kit.counts.BLOCKED === 1);
-  check('one attachment (READY with a CV)', kit.attachments.length === 1 && kit.attachments[0].filename === 'Uri_Levy_CV_Acme_b.pdf');
+  check('one attachment (READY with a CV)', kit.attachments.length === 1 && kit.attachments[0].filename === 'Uri_Levy_CV.pdf');
+  check('cvLine: provenance text wins', cvLine({ cv: { status: 'reused' } }, 'a.pdf', 'Tailored for “X <y>”').includes('Tailored for “X &lt;y&gt;”'));
   check('html escapes company', kit.html.includes('Acme &lt;b&gt;') && !kit.html.includes('Acme <b>'));
   check('unsafe url gets no button', !kit.html.includes('javascript:'));
   check('safe url becomes Apply button', kit.html.includes('href="https://acme.com/j/1"'));

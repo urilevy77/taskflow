@@ -3,12 +3,15 @@
 // daily.mjs — the scheduled entry point for design/autopilot-plan.md's Layer 2.
 //
 // Stages, in order (see the plan's stage table):
-//   1. goozali-sync.mjs   — Mondays only, REPORT-ONLY by default (never
+//   1. goozali-sync.mjs   — every day, companies added in the last 24h only
+//                            (--since-hours 24), REPORT-ONLY by default (never
 //                            writes portals.yml unattended unless you pass
 //                            --goozali-apply — that's a config-file edit
 //                            with no human in the loop otherwise, and
 //                            nothing in the agreed plan authorizes it)
 //   2. scan-all.mjs       — WhatsApp drain + board scan → data/pipeline.md
+//   2a. goozali-jobs.mjs  — Goozali job postings added since the last run that
+//                            pass portals.yml title_filter and ask ≤2y → pipeline
 //   2b. enrich-leads.mjs  — resolve Company/Title/Location for bare intake
 //                            rows BEFORE triage sees them (zero-token HTTP)
 //   3-5. triage-run.mjs   — lane routing + modes/triage.md, budgeted
@@ -89,9 +92,11 @@ const USAGE = `
     --budget-enrich N   cap bare rows resolved by the enrich stage (default: all — it costs no tokens)
     --skip-enrich       don't run enrich-leads.mjs before triage
     --skip-dedup        don't run dedup-intake.mjs (cross-source company+role duplicates) before triage
-    --skip-goozali      don't run goozali-sync.mjs even on a Monday
+    --skip-marks        don't pull the taps made on the phone (autopilot/marks-sync.mjs)
+    --skip-goozali      don't run goozali-sync.mjs (it runs every day: companies added to the directory in the last 24h)
     --goozali-apply     let goozali-sync.mjs write portals.yml (default: report-only)
     --skip-scan         don't run scan-all.mjs
+    --skip-goozali-jobs don't add Goozali job postings (autopilot/goozali-jobs.mjs)
     --skip-exp-gate     don't run experience-gate.mjs (the ≤2-years filter)
     --skip-triage       don't run triage-run.mjs
     --skip-prepare      don't run prepare-new.mjs (JD archive + READY/CHECK/BLOCKED for new PASS jobs)
@@ -107,9 +112,16 @@ const USAGE = `
 // spawning anything.
 // ---------------------------------------------------------------------------
 
-/** @param {Date} date */
-export function isGoozaliDay(date) {
-  return date.getDay() === 1; // Monday
+
+export const GOOZALI_SINCE_HOURS = 24;
+
+/** goozali-sync.mjs --json output → the one-line stage summary. Pure. */
+export function goozaliSummary(parsed, applyWrites = false) {
+  const n = Array.isArray(parsed?.candidates) ? parsed.candidates.length : undefined;
+  const window = parsed?.datesAvailable === false ? 'directory has no dates — checked all rows' : `${parsed?.inWindow ?? '?'} added/updated in the last ${parsed?.sinceHours ?? GOOZALI_SINCE_HOURS}h`;
+  return applyWrites
+    ? `applied (${window}; ${n ?? '?'} companies written)`
+    : `report-only (${window}; ${n ?? '?'} new companies found, not written — pass --goozali-apply)`;
 }
 
 export function buildStageResult(name, ok, summary, durationMs, extra = {}) {
@@ -240,19 +252,27 @@ async function stagePreflight(needCli, cliName) {
   return `ok (CLI: ${cli ? cli.bin : 'n/a'}; ${whatsapp})`;
 }
 
+// Taps made on the phone (the site's worker keeps them until now) -> tracker / follow-ups. Unconfigured is not a failure.
+async function stageMarks() {
+  const out = await runNode(join(ROOT, 'autopilot', 'marks-sync.mjs'), ['--in-daily'], SHORT_TIMEOUT_MS);
+  return out.trim().split(/\r?\n/).filter(Boolean).pop() ?? 'no output';
+}
+
 async function stageGoozali(applyWrites) {
-  const args = ['--json'];
+  const args = ['--json', '--since-hours', String(GOOZALI_SINCE_HOURS)];
   if (applyWrites) args.push('--apply');
   const out = await runNode(join(ROOT, 'goozali-sync.mjs'), args, SHORT_TIMEOUT_MS);
   try {
-    const parsed = JSON.parse(out);
-    const n = Array.isArray(parsed.pending ?? parsed.companies) ? (parsed.pending ?? parsed.companies).length : undefined;
-    return applyWrites
-      ? `applied${n !== undefined ? ` (${n} companies)` : ''}`
-      : `report-only${n !== undefined ? ` (${n} new companies found, not written — pass --goozali-apply)` : ''}`;
+    return goozaliSummary(JSON.parse(out), applyWrites);
   } catch {
     return applyWrites ? 'applied (unparsed output)' : 'report-only (unparsed output)';
   }
+}
+
+// After scan (so scan-history already holds today's board hits for dedup), before enrich/dedup/triage.
+async function stageGoozaliJobs() {
+  const out = await runNode(join(ROOT, 'autopilot', 'goozali-jobs.mjs'), [], SHORT_TIMEOUT_MS * 2);
+  return out.trim().split('\n').filter(Boolean).pop() ?? 'goozali-jobs.mjs completed';
 }
 
 async function stageScan() {
@@ -401,9 +421,11 @@ async function main(argv) {
 
   const dryRun = hasFlag(argv, '--dry-run');
   const budgetTriage = flagValue(argv, '--budget-triage') ?? DEFAULT_BUDGET_TRIAGE;
+  const skipMarks = hasFlag(argv, '--skip-marks');
   const skipGoozali = hasFlag(argv, '--skip-goozali');
   const goozaliApply = hasFlag(argv, '--goozali-apply');
   const skipScan = hasFlag(argv, '--skip-scan');
+  const skipGoozaliJobs = hasFlag(argv, '--skip-goozali-jobs');
   const skipEnrich = hasFlag(argv, '--skip-enrich');
   const skipTriage = hasFlag(argv, '--skip-triage');
   const skipDedup = hasFlag(argv, '--skip-dedup');
@@ -422,8 +444,10 @@ async function main(argv) {
 
   const plan = [
     { name: 'preflight', run: true, detail: 'CLI on PATH, cv.md, modes/_brief.md, WhatsApp session note' },
-    { name: 'goozali', run: !skipGoozali && isGoozaliDay(now), detail: skipGoozali ? 'skipped (--skip-goozali)' : isGoozaliDay(now) ? (goozaliApply ? 'report + apply' : 'report-only') : 'skipped (not Monday)' },
+    { name: 'marks', run: !skipMarks, detail: skipMarks ? 'skipped (--skip-marks)' : 'marks-sync.mjs — record the taps made on the phone (I applied / Skip / follow-ups) before anything reads the tracker' },
+    { name: 'goozali', run: !skipGoozali, detail: skipGoozali ? 'skipped (--skip-goozali)' : `companies added/updated in the last ${GOOZALI_SINCE_HOURS}h, ${goozaliApply ? 'report + apply' : 'report-only'}` },
     { name: 'scan', run: !skipScan, detail: skipScan ? 'skipped (--skip-scan)' : 'scan-all.mjs (WhatsApp + boards)' },
+    { name: 'goozali-jobs', run: !skipGoozaliJobs, detail: skipGoozaliJobs ? 'skipped (--skip-goozali-jobs)' : 'goozali-jobs.mjs — Goozali job postings since the last run, your title filter, ≤2y experience → pipeline (free, 1 request)' },
     { name: 'enrich', run: !skipEnrich, detail: skipEnrich ? 'skipped (--skip-enrich)' : `enrich-leads.mjs --write${budgetEnrich ? ` --limit ${budgetEnrich}` : ' (all bare rows)'}` },
     { name: 'dedup', run: !skipDedup, detail: skipDedup ? 'skipped (--skip-dedup)' : 'dedup-intake.mjs --write — same job from two sources → dup-of, never triaged (free)' },
     { name: 'exp-gate', run: !skipExpGate, detail: skipExpGate ? 'skipped (--skip-exp-gate)' : `experience-gate.mjs — reads each new job's description, drops the ones asking more than ${MAX_YEARS} years (free)` },
@@ -446,16 +470,29 @@ async function main(argv) {
 
   stages.push(await runStage('preflight', () => stagePreflight(!skipTriage, cli)));
 
-  if (!skipGoozali && isGoozaliDay(now)) {
+  // Before anything reads the tracker: what you tapped on the phone since the last run is recorded first.
+  if (!skipMarks) {
+    stages.push(await runStage('marks', () => stageMarks()));
+  } else {
+    stages.push(buildStageResult('marks', true, 'skipped (--skip-marks)', 0));
+  }
+
+  if (!skipGoozali) {
     stages.push(await runStage('goozali', () => stageGoozali(goozaliApply)));
   } else {
-    stages.push(buildStageResult('goozali', true, skipGoozali ? 'skipped (--skip-goozali)' : 'skipped (not Monday)', 0));
+    stages.push(buildStageResult('goozali', true, 'skipped (--skip-goozali)', 0));
   }
 
   if (!skipScan) {
     stages.push(await runStage('scan', () => stageScan()));
   } else {
     stages.push(buildStageResult('scan', true, 'skipped (--skip-scan)', 0));
+  }
+
+  if (!skipGoozaliJobs) {
+    stages.push(await runStage('goozali-jobs', () => stageGoozaliJobs()));
+  } else {
+    stages.push(buildStageResult('goozali-jobs', true, 'skipped (--skip-goozali-jobs)', 0));
   }
 
   if (!skipEnrich) {
@@ -523,9 +560,8 @@ function selfTest() {
     else console.log(`ok: ${name}`);
   };
 
-  check('isGoozaliDay: Monday true', isGoozaliDay(new Date('2026-09-28T09:00:00'))); // a Monday
-  check('isGoozaliDay: Tuesday false', !isGoozaliDay(new Date('2026-09-29T09:00:00')));
-  check('isGoozaliDay: Sunday false', !isGoozaliDay(new Date('2026-09-27T09:00:00')));
+  check('goozaliSummary: counts the window and the new companies', goozaliSummary({ inWindow: 3, sinceHours: 24, datesAvailable: true, candidates: [{}, {}] }) === 'report-only (3 added/updated in the last 24h; 2 new companies found, not written — pass --goozali-apply)');
+  check('goozaliSummary: says so when the directory has no dates', goozaliSummary({ datesAvailable: false, candidates: [] }).includes('no dates'));
 
   const result = buildStageResult('scan', true, 'ok summary', 1234);
   check('buildStageResult shape', result.name === 'scan' && result.ok === true && result.durationMs === 1234);

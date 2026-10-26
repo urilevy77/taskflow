@@ -25,6 +25,9 @@
  *   - Authorization is the `accessPolicy` blob embedded in the embed page's
  *     HTML, passed straight back as a query parameter.
  *   - `stringifiedObjectParams` must request the nested response format.
+ *   - The session cookies the embed page sets must be sent back (Cookie header), with
+ *     `x-requested-with` and a Referer, as a browser does. Without them every call is 401
+ *     (seen 2026-10-06; before that the call worked without cookies).
  *
  * FRAGILITY, STATED PLAINLY: this reads a private API that Airtable does not
  * document and can change without notice, and only the company-directory view
@@ -35,12 +38,15 @@
  *   node goozali-sync.mjs              # report new companies, write nothing
  *   node goozali-sync.mjs --apply      # insert them into portals.yml
  *   node goozali-sync.mjs --json       # machine-readable
+ *   node goozali-sync.mjs --since-hours 24   # only companies added or updated in the last 24h
+ *                                            # (what the daily run uses; row createdTime + the "Updated" column)
  */
 
 import fs from 'node:fs';
 import * as yaml from 'js-yaml';
 import { loadProviders, resolveProvider } from './providers/_registry.mjs';
 import { getCareerOpsRoot } from './path-resolver.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
 
 const SHARE_ID = 'shrNtlFxOG2ag1kyB';
 const EMBED = `https://airtable.com/embed/${SHARE_ID}`;
@@ -49,6 +55,8 @@ const UA = 'Mozilla/5.0';
 const argv = process.argv.slice(2);
 const APPLY = argv.includes('--apply');
 const JSON_OUT = argv.includes('--json');
+const sinceAt = argv.indexOf('--since-hours');
+const SINCE_HOURS = sinceAt >= 0 ? Number(argv[sinceAt + 1]) || 0 : 0;
 
 /** Pull the three values the data call needs out of the embed page HTML. */
 export function extractViewParams(html) {
@@ -77,14 +85,41 @@ export function parseDirectory(payload) {
     company: cell(r, 'Company'),
     careersUrl: cell(r, 'Careers URL'),
     hiring: cell(r, 'Hiring') === true || cell(r, 'Hiring') === 'Yes',
+    createdTime: r.createdTime ?? null, // when the row was added to the directory (Airtable sets it)
+    updated: cell(r, 'Updated') ?? null, // goozali's own "Updated" date — rows change far more often than new ones appear
   })).filter((r) => r.company && r.careersUrl);
 }
 
+/**
+ * Keep only rows added OR updated in the last `hours` (an update can flip a company to hiring; new rows
+ * are rare — none between 2026-07 and 2026-10). When the directory carries no dates at all, nothing can
+ * be filtered: every row is returned and `dated` is false, so the caller can say so instead of reporting 0.
+ */
+export function filterRecent(rows, hours, now = Date.now()) {
+  if (!hours) return { rows, dated: true };
+  const latest = (r) => Math.max(Date.parse(r.createdTime ?? '') || 0, Date.parse(r.updated ?? '') || 0);
+  const dated = rows.some((r) => latest(r) > 0);
+  if (!dated) return { rows, dated: false };
+  const cutoff = now - hours * 3_600_000;
+  return { rows: rows.filter((r) => latest(r) >= cutoff), dated: true };
+}
+
 async function fetchDirectory() {
-  const html = await (await fetch(EMBED, { headers: { 'user-agent': UA } })).text();
+  return parseDirectory(await readSharedView(EMBED));
+}
+
+/**
+ * One read of a public Airtable shared view (a goozali.com embed) → the raw nested-format payload.
+ * Shared by goozali-sync.mjs (company directory) and autopilot/goozali-jobs.mjs (job postings).
+ */
+export async function readSharedView(embedUrl) {
+  const page = await fetch(embedUrl, { headers: { 'user-agent': UA } });
+  const html = await page.text();
+  // Since ~2026-10 the data call is refused (401) without the session cookies the embed page sets.
+  const cookie = (page.headers.getSetCookie?.() ?? []).map((c) => c.split(';')[0]).join('; ');
   const { appId, accessPolicy, viewId } = extractViewParams(html);
   if (!appId || !accessPolicy || !viewId) {
-    throw new Error('goozali-sync: could not extract view params from the embed page — the page shape changed');
+    throw new Error('goozali: could not extract view params from the embed page — the page shape changed');
   }
   const url = `https://airtable.com/v0.3/view/${viewId}/readSharedViewData`
     + `?stringifiedObjectParams=${encodeURIComponent('{"shouldUseNestedResponseFormat":true}')}`
@@ -92,6 +127,9 @@ async function fetchDirectory() {
     + `&accessPolicy=${accessPolicy}`;
   const res = await fetch(url, {
     headers: {
+      cookie,
+      'x-requested-with': 'XMLHttpRequest',
+      referer: embedUrl,
       'x-airtable-application-id': appId,
       'x-time-zone': 'Asia/Jerusalem',
       'x-user-locale': 'en',
@@ -101,8 +139,9 @@ async function fetchDirectory() {
   });
   if (res.status === 401) {
     throw new Error(
-      'goozali-sync: HTTP 401 from readSharedViewData.\n'
-      + '  This is almost always throttling, not a broken script: Airtable flags the\n'
+      'goozali: HTTP 401 from readSharedViewData.\n'
+      + '  First check the embed page still sets session cookies (the call needs them since\n'
+      + '  2026-10; without them every request is 401). Otherwise it is throttling: Airtable flags the\n'
       + '  caller after a burst of shared-view reads and then rejects the accessPolicy\n'
       + '  token even though the embed page still hands one out. Verified behaviour —\n'
       + '  the same call returned 990 rows before the throttle and 401 after it.\n'
@@ -110,8 +149,8 @@ async function fetchDirectory() {
       + '  directory changes slowly and there is nothing to gain from polling it.',
     );
   }
-  if (!res.ok) throw new Error(`goozali-sync: readSharedViewData returned HTTP ${res.status}`);
-  return parseDirectory(await res.json());
+  if (!res.ok) throw new Error(`goozali: readSharedViewData returned HTTP ${res.status}`);
+  return res.json();
 }
 
 function yamlBlock(entries, today) {
@@ -134,7 +173,8 @@ async function main() {
     .map((e) => String(e.name ?? '').toLowerCase().trim()));
 
   const providers = await loadProviders(`${root}/providers`);
-  const rows = await fetchDirectory();
+  const all = await fetchDirectory();
+  const { rows, dated } = filterRecent(all, SINCE_HOURS);
 
   const candidates = [];
   let hiring = 0, unclaimed = 0;
@@ -150,7 +190,10 @@ async function main() {
   }
 
   const summary = {
-    directoryRows: rows.length,
+    directoryRows: all.length,
+    sinceHours: SINCE_HOURS || null,
+    datesAvailable: dated,
+    inWindow: rows.length,
     hiring,
     noProvider: unclaimed,
     alreadyTracked: hiring - unclaimed - candidates.length,
@@ -172,6 +215,7 @@ async function main() {
   console.log('\nGoozali directory sync');
   console.log('─'.repeat(40));
   console.log(`Directory rows:        ${summary.directoryRows}`);
+  if (SINCE_HOURS) console.log(dated ? `  added/updated last ${SINCE_HOURS}h: ${rows.length}` : `  ⚠ the directory has no dates — could not limit to the last ${SINCE_HOURS}h, checked all rows`);
   console.log(`  flagged hiring:      ${summary.hiring}`);
   console.log(`  no provider claims:  ${summary.noProvider}`);
   console.log(`  already tracked:     ${summary.alreadyTracked}`);
@@ -184,4 +228,7 @@ async function main() {
     : '\nRe-run with --apply to insert these into portals.yml.');
 }
 
-main().catch((err) => { console.error(err.message); process.exit(1); });
+// Imported (tests) → don't hit the network.
+if (isMainModule(import.meta.url)) {
+  main().catch((err) => { console.error(err.message); process.exit(1); });
+}

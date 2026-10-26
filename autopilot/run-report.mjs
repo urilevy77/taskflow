@@ -14,6 +14,7 @@ import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { getCareerOpsRoot } from '../path-resolver.mjs';
 import { isMainModule } from '../lib/is-main-module.mjs';
+import { layout } from './site-pages.mjs';
 
 const ROOT = getCareerOpsRoot();
 const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -104,7 +105,7 @@ const TOTAL_LABELS = [
 ];
 
 /** Pure: full run page. `runDates` feeds the history links. */
-export function renderRunPage(digest, scan, { runDates = [], todos = [], jobsLink = true } = {}) {
+export function renderRunPage(digest, scan, { runDates = [], todos = [], jobsLink = true, applyCount = 0 } = {}) {
   const stages = digest.stages ?? [];
   const failed = stages.filter((s) => !s.ok);
   const secs = (ms) => `${(ms / 1000).toFixed(1)}s`;
@@ -115,34 +116,24 @@ export function renderRunPage(digest, scan, { runDates = [], todos = [], jobsLin
   const stageRows = stages.map((s) => `<tr><td>${s.ok ? '✅' : '❌'}</td><td><b>${esc(s.name)}</b></td><td class="r">${mins(s.durationMs)}</td><td>${esc(s.summary)}${s.detail ? `<pre>${esc(s.detail)}</pre>` : ''}</td></tr>`).join('');
   const chips = Object.entries(scan.statusCounts).sort((a, b) => (STATUS_ORDER[a[0]] ?? 6) - (STATUS_ORDER[b[0]] ?? 6))
     .map(([k, n]) => `<span class="chip">${ICON[k] ?? ''} ${esc(LABEL[k] ?? k)}: <b>${n}</b></span>`).join('');
-  const totals = scan.totals ? `<div class="grid">${TOTAL_LABELS.filter(([k]) => scan.totals[k] !== undefined).map(([k, l]) => `<div class="kpi"><b>${esc(scan.totals[k])}</b><span>${l}</span></div>`).join('')}</div>` : '<p class="muted">No scan totals recorded for this run.</p>';
+  const totals = scan.totals ? `<div class="kpis">${TOTAL_LABELS.filter(([k]) => scan.totals[k] !== undefined).map(([k, l]) => `<div class="kpi"><b>${esc(scan.totals[k])}</b><span>${l}</span></div>`).join('')}</div>` : '<p class="muted">No scan totals recorded for this run.</p>';
   const boardRows = scan.boards.map((b) => `<tr class="${b.status === 'reachable' ? '' : 'bad'}"><td>${esc(b.name)}</td><td>${ICON[b.status] ?? ''} ${esc(LABEL[b.status] ?? b.status)}</td><td class="r">${b.found ?? '—'}</td><td class="r">${b.added || ''}</td></tr>`).join('');
   const wa = scan.whatsapp.length ? `<table><tr><th>group</th><th class="r">links</th></tr>${scan.whatsapp.map((w) => `<tr><td>${esc(w.group)}</td><td class="r">${w.links}</td></tr>`).join('')}</table>` : '<p class="muted">No WhatsApp links collected in this run window.</p>';
   const history = runDates.length ? `<p class="muted">Other runs: ${runDates.slice(0, 14).map((d) => (d === day ? `<b>${d}</b>` : `<a href="/run/${d}">${d}</a>`)).join(' · ')}</p>` : '';
   const todoHtml = todos.length ? `<h2>Open to-dos (${todos.length})</h2><ul>${todos.map((t) => `<li>${esc(t)}</li>`).join('')}</ul>` : '';
 
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Autopilot ${esc(day)}</title>
-<style>
-:root{--bg:#f6f8fa;--card:#fff;--fg:#1f2328;--mut:#57606a;--line:#d0d7de;--bad:#fff1f0}
-@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--fg:#e6edf3;--mut:#8b949e;--line:#30363d;--bad:#2d1618}}
-body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif}main{max-width:820px;margin:0 auto;padding:16px}
-section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 16px;margin:14px 0;overflow-x:auto}
-h1{font-size:20px;margin:8px 0}h2{font-size:16px;margin:4px 0 8px}table{border-collapse:collapse;width:100%;font-size:13px}
-th,td{padding:5px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.r{text-align:right}tr.bad{background:var(--bad)}
-pre{white-space:pre-wrap;font-size:11px;margin:4px 0 0}.muted{color:var(--mut);font-size:13px}.chip{display:inline-block;border:1px solid var(--line);border-radius:99px;padding:2px 10px;margin:2px 4px 2px 0;font-size:13px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px;margin:8px 0}.kpi{border:1px solid var(--line);border-radius:8px;padding:8px}.kpi b{display:block;font-size:20px}.kpi span{color:var(--mut);font-size:12px}
-a{color:#0969da}
-</style></head><body><main>
-<h1>${failed.length ? '❌' : '✅'} Autopilot — ${esc(day)}</h1>
-<p class="muted">Run <code>${esc(digest.run_id)}</code> · ${mins(total)} · ${stages.length - failed.length}/${stages.length} stages ok${failed.length ? ` · FAILED: ${esc(failed.map((s) => s.name).join(', '))}` : ''}</p>
-<section><h2>Stages</h2><table>${stageRows}</table></section>
-<section><h2>Scan totals</h2>${totals}</section>
-<section><h2>Scan status per source (${scan.boards.length})</h2><p>${chips}</p>
+  const body = `<p class="muted" style="margin:6px 0 0"><a href="/runs">← Runs</a></p>
+<h1>${failed.length ? '❌' : '✅'} Run <em>${esc(day)}</em></h1>
+<p class="sub">Run <code>${esc(digest.run_id)}</code> · ${mins(total)} · ${stages.length - failed.length}/${stages.length} stages ok${failed.length ? ` · FAILED: ${esc(failed.map((s) => s.name).join(', '))}` : ''}</p>
+${jobsLink ? '<div class="row"><a class="btn primary" href="/apply">Jobs to apply to →</a></div>' : ''}
+<h2>Stages</h2><div class="card scroll"><table>${stageRows}</table></div>
+<h2>Scan totals</h2>${totals}
+<h2>Sources (${scan.boards.length})</h2><div class="card scroll"><p style="margin:0 0 6px">${chips}</p>
 <p class="muted">Problem sources first. “found” = jobs the board returned before filters; “new” = rows added to the pipeline today.</p>
-<table><tr><th>source</th><th>status</th><th class="r">found</th><th class="r">new</th></tr>${boardRows}</table></section>
-<section><h2>WhatsApp groups</h2>${wa}</section>
-<section>${jobsLink ? '<p><a href="/">→ Jobs to apply to (CVs + “I applied”)</a></p>' : ''}${todoHtml}${history}</section>
-</main></body></html>`;
+<table><tr><th>source</th><th>status</th><th class="r">found</th><th class="r">new</th></tr>${boardRows}</table></div>
+<h2>WhatsApp groups</h2><div class="card scroll">${wa}</div>
+${todoHtml ? `<div class="card prose">${todoHtml}</div>` : ''}${history ? `<div class="card">${history}</div>` : ''}`;
+  return layout({ title: `Run ${day} · Job search`, active: 'runs', body, applyCount });
 }
 
 function selfTest() {

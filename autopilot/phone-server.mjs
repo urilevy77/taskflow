@@ -20,6 +20,11 @@
 //
 //   node autopilot/phone-server.mjs              # serve (token + host from .env)
 //   node autopilot/phone-server.mjs --print-link # the URL to open on the phone, token included
+//   node autopilot/phone-server.mjs --mark 134=applied,129=skip   # record marks made on the static site's Apply page
+//   node autopilot/phone-server.mjs --mark-lead 3f2a9c01be=applied # …and on its Filtered page (adds tracker rows)
+//   node autopilot/phone-server.mjs --mark-lead 3f2a9c01be=pass    # move a filtered lead to PASS, then prepare it for the Apply page
+//   node autopilot/phone-server.mjs --mark-followup 135=followed,136=retire   # …and on its Follow up page
+// (When the site's sync is set up — autopilot/marks-sync.mjs — the daily run does all three by itself.)
 //   node autopilot/phone-server.mjs --self-test
 
 import http from 'node:http';
@@ -32,10 +37,17 @@ import { getCareerOpsRoot, resolveTrackerPath } from '../path-resolver.mjs';
 import { flagValue, hasFlag } from '../lib/cli-flags.mjs';
 import { isMainModule } from '../lib/is-main-module.mjs';
 import { parseTrackerRows } from '../find.mjs';
-import { findBundleCv, cvAttachmentName, safeHttpUrl } from './apply-kit.mjs';
+import { findBundleCv, CV_FILENAME, safeHttpUrl } from './apply-kit.mjs';
+import { cvSource, describeCvSource } from './cv-library.mjs';
+import { sourceIndex, describeSource, fitSentence } from './job-origin.mjs';
 import { buildTrackerTsv } from './prepare-new.mjs';
 import { renderRunPage, loadScanStatus, listRunDates } from './run-report.mjs';
 import { parseOpenTodos } from './notify-mail.mjs';
+import { readFiltered, readTracker, leadId } from './site-pages.mjs';
+import { normalizeUrl } from '../url-key.mjs';
+import { reserveReportNumbers, releaseReportNumbers } from '../reserve-report-num.mjs';
+import { withPipelineLock } from '../pipeline-lock.mjs';
+import { parseFollowupMarks, applyFollowupMarks } from './followups.mjs';
 
 const ROOT = getCareerOpsRoot();
 const DONE_STATUSES = new Set(['applied', 'responded', 'interview', 'offer', 'hired', 'rejected', 'skip', 'discarded']);
@@ -59,6 +71,7 @@ export function loadJobs(root = ROOT, now = Date.now()) {
   const trackerPath = resolveTrackerPath(root);
   const tracker = existsSync(trackerPath) ? parseTrackerRows(readFileSync(trackerPath, 'utf-8')) : [];
   const statusByReport = new Map(tracker.filter((t) => t.reportNum != null).map((t) => [Number(t.reportNum), String(t.status).toLowerCase()]));
+  const sourceOf = sourceIndex(root);
 
   const jobs = [];
   for (const d of readdirSync(out, { withFileTypes: true })) {
@@ -76,7 +89,8 @@ export function loadJobs(root = ROOT, now = Date.now()) {
     jobs.push({
       num, company: state.company || '(unknown)', title: state.role || '', label: state.label ?? (hasCv ? 'READY' : 'CHECK'),
       score: state.score ?? null, reason: state.triage_reason ?? '', reasons: state.reasons ?? [], url: safeHttpUrl(state.url),
-      location: state.location ?? '', hasCv: Boolean(cv), cvPath: cv, status, done, bundle: `output/${d.name}`, state,
+      location: state.location ?? '', hasCv: Boolean(cv), cvPath: cv, cvFrom: cv ? describeCvSource(cvSource(cv)) : '',
+      source: describeSource(sourceOf(state.url)), why: fitSentence(state), status, done, bundle: `output/${d.name}`, state,
     });
   }
   return jobs.sort((a, b) => Number(a.done) - Number(b.done) || (Number(b.score) || 0) - (Number(a.score) || 0));
@@ -92,11 +106,12 @@ export function renderPage(jobs) {
   const card = (j) => `<section class="card" data-num="${j.num}" style="border-left-color:${color[j.label] ?? '#8c959f'}">
 <div class="meta">${esc(j.label)}${j.score != null ? ` · ${esc(Number(j.score).toFixed(1))}/5` : ''}${j.location ? ` · ${esc(j.location)}` : ''}</div>
 <h2>${esc(j.company)} — ${esc(j.title)}</h2>
-${j.reason ? `<p>${esc(j.reason)}</p>` : ''}${j.reasons.map((r) => `<p class="warn">⚠ ${esc(r)}</p>`).join('')}
+${j.why ? `<p><b>Why:</b> ${esc(j.why)}</p>` : ''}${j.source ? `<p class="muted">Source: ${esc(j.source)}</p>` : ''}${j.reasons.map((r) => `<p class="warn">⚠ ${esc(r)}</p>`).join('')}
 <div class="row">
 ${j.hasCv ? `<a class="btn ghost" href="/cv/${j.num}">📄 CV (PDF)</a>` : '<span class="muted">No CV yet</span>'}
 ${j.url ? `<a class="btn primary" href="${esc(j.url)}" target="_blank" rel="noopener noreferrer">Apply ›</a>` : ''}
 </div>
+${j.cvFrom ? `<p class="muted">📄 ${esc(j.cvFrom)}</p>` : ''}
 ${j.done ? `<p class="muted">Status: ${esc(j.status)}</p>` : `<div class="row">
 <button class="btn ok" data-act="applied">✔ I applied</button><button class="btn ghost" data-act="skip">Skip</button></div>`}
 </section>`;
@@ -195,7 +210,7 @@ export async function route(req, ctx) {
   if (req.method === 'GET' && cv) {
     const job = loadJobs(root).find((j) => j.num === Number(cv[1]));
     if (!job || !job.cvPath) return json(404, { error: 'no CV for that job' });
-    return { status: 200, file: job.cvPath, headers: { 'content-type': 'application/pdf', 'content-disposition': `inline; filename="${cvAttachmentName(job.company)}"`, 'cache-control': 'no-store' }, body: '' };
+    return { status: 200, file: job.cvPath, headers: { 'content-type': 'application/pdf', 'content-disposition': `inline; filename="${CV_FILENAME}"`, 'cache-control': 'no-store' }, body: '' };
   }
 
   if (req.method === 'POST' && u.pathname === '/act') {
@@ -212,9 +227,9 @@ export async function route(req, ctx) {
   return json(404, { error: 'not found' });
 }
 
-function runNodeScript(script, args) {
+function runNodeScript(script, args, { timeout = 30_000 } = {}) {
   return new Promise((resolve) => {
-    execFile(process.execPath, [join(ROOT, script), ...args], { cwd: ROOT, timeout: 30_000, env: { ...process.env, CAREER_OPS_TRACKER_LOCK_TIMEOUT_MS: '10000' } }, (err, stdout, stderr) => {
+    execFile(process.execPath, [join(ROOT, script), ...args], { cwd: ROOT, timeout, env: { ...process.env, CAREER_OPS_TRACKER_LOCK_TIMEOUT_MS: '10000' } }, (err, stdout, stderr) => {
       resolve({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, out: `${stdout}${stderr}`.trim() });
     });
   });
@@ -240,6 +255,149 @@ export async function act(job, action, { root, run, today }) {
   if (m.code !== 0) return json(500, { error: `merge-tracker failed (exit ${m.code})`, detail: m.out.slice(-300) });
   if (action === 'applied') await run('set-status.mjs', ['--report', String(job.num), 'Applied', '--note', note, '--source', 'web']); // seeds the follow-up (no-op if already Applied)
   return json(200, { ok: true, status, created: true });
+}
+
+/** "134=applied,129=skip" (copied from the site's Apply page) → [{ num, action }]; anything malformed → null. */
+export function parseMarks(spec) {
+  const parts = String(spec ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+  const out = parts.map((p) => p.match(/^(\d{1,6})=(applied|skip)$/)).map((m) => (m ? { num: Number(m[1]), action: m[2] } : null));
+  return out.length && out.every(Boolean) ? /** @type {{num:number, action:string}[]} */ (out) : null;
+}
+
+/** Records marks made on the site, one by one, through act(). Already-done jobs are left alone. */
+export async function applyMarks(marks, { root = ROOT, run = runNodeScript, today = new Date().toISOString().slice(0, 10) } = {}) {
+  const jobs = loadJobs(root);
+  const lines = [];
+  for (const { num, action } of marks) {
+    const job = jobs.find((j) => j.num === num);
+    if (!job) { lines.push(`#${num}: not in the apply list — skipped`); continue; }
+    if (job.done) { lines.push(`#${num} ${job.company}: already ${job.status} — left as is`); continue; }
+    const r = await act(job, action, { root, run, today });
+    const body = JSON.parse(r.body);
+    lines.push(r.status === 200 ? `#${num} ${job.company}: ${body.status}${body.created ? ' (tracker row added)' : ''}` : `#${num} ${job.company}: FAILED — ${body.error}`);
+  }
+  return lines;
+}
+
+/** "3f2a9c01be=applied,…" (copied from the site's Filtered page) → [{ id, action }]; anything malformed → null. */
+export function parseLeadMarks(spec) {
+  const parts = String(spec ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+  const out = parts.map((p) => p.match(/^([0-9a-f]{10})=(applied|skip|pass)$/)).map((m) => (m ? { id: m[1], action: m[2] } : null));
+  return out.length && out.every(Boolean) ? /** @type {{id:string, action:string}[]} */ (out) : null;
+}
+
+const FILTERED_LINE_RE = /^- \[[ xX]\] (.+?) \| triage: (FAIL|MARGINAL|SKIP)(?: (\d+(?:\.\d+)?)\/5)?\s*(?:[—-]\s*(.*))?$/;
+
+/**
+ * Pure: moves the filtered lead `id` to PASS in pipeline.md text. Its latest triage line (the one the
+ * Filtered page shows) becomes an open `triage: PASS` row that prepare-new.mjs picks up, with the old
+ * verdict kept in the reason; older lines for the same posting get `| dup-of: moved-to-pass` so the
+ * Filtered page stops listing them. → { text, moved }.
+ */
+export function moveLeadToPass(text, id) {
+  const eol = /\r\n/.test(text) ? '\r\n' : '\n';
+  const lines = String(text ?? '').split(/\r?\n/);
+  const hits = [];
+  lines.forEach((line, i) => {
+    const m = line.match(FILTERED_LINE_RE);
+    if (!m || /\| dup-of:/.test(line)) return;
+    const url = safeHttpUrl(m[1].split(' | ')[0].trim());
+    if (url && leadId(url) === id) hits.push({ i, m });
+  });
+  if (!hits.length) return { text, moved: false };
+  const { i, m } = hits.pop();
+  const score = m[3] != null ? Number(m[3]).toFixed(1) : '0.0';
+  const was = `${m[2]}${m[4] ? `: ${m[4].replace(/\|/g, '/').trim()}` : ''}`;
+  lines[i] = `- [ ] ${m[1]} | triage: PASS ${score}/5 — moved to PASS by you (was ${was})`;
+  for (const h of hits) lines[h.i] = `${lines[h.i]} | dup-of: moved-to-pass`;
+  return { text: lines.join(eol), moved: true };
+}
+
+/**
+ * Records marks made on the Filtered page. A lead whose URL is already tracked gets set-status (unless it
+ * is already done); a new one gets a reserved row number, a tracker-additions TSV at its final status
+ * (score = triage score, no report), and merge-tracker.mjs. A "pass" mark moves the lead to PASS in
+ * pipeline.md and then runs prepare-new.mjs, which gives it a bundle + tracker row so it lands on the
+ * Apply page (pass `prepare: false` to leave that for the next daily run). A CV is not needed: a prepared
+ * job shows on Apply either way ("No CV available yet"). `publish` (async → status line) republishes the
+ * static site afterwards so the moved jobs appear there at once instead of after the next daily run.
+ */
+export async function applyLeadMarks(marks, { root = ROOT, run = runNodeScript, today = new Date().toISOString().slice(0, 10), reserve = reserveReportNumbers, release = releaseReportNumbers, prepare = true, publish = null } = {}) {
+  const pipelineFile = join(root, 'data', 'pipeline.md');
+  const leads = existsSync(pipelineFile) ? readFiltered(readFileSync(pipelineFile, 'utf-8')) : [];
+  const lines = [];
+  const toPass = [];
+  for (const { id, action } of marks) {
+    const lead = leads.find((l) => l.id === id);
+    if (!lead) { lines.push(`${id}: not in the filtered list — skipped`); continue; }
+    const name = `${lead.company || 'Unknown company'} — ${lead.role || 'Job lead'}`;
+    if (action === 'pass') { toPass.push({ lead, name }); continue; }
+    const status = action === 'applied' ? 'Applied' : 'SKIP';
+    const note = `${action === 'applied' ? 'applied' : 'skipped'} via phone (filtered lead, triage ${lead.verdict}${lead.score != null ? ` ${lead.score.toFixed(1)}` : ''})`;
+    const trackerPath = resolveTrackerPath(root);
+    const tracker = existsSync(trackerPath) ? readTracker(readFileSync(trackerPath, 'utf-8')) : [];
+    const row = tracker.find((t) => t.url && normalizeUrl(t.url) === normalizeUrl(lead.url));
+    if (row) {
+      if (DONE_STATUSES.has(String(row.status).toLowerCase())) { lines.push(`#${row.num} ${name}: already ${row.status} — left as is`); continue; }
+      const r = await run('set-status.mjs', ['--row', String(row.num), status, '--note', note, '--source', 'web']);
+      lines.push(r.code === 0 ? `#${row.num} ${name}: ${status}` : `#${row.num} ${name}: FAILED — set-status exit ${r.code}${r.code === 4 ? ' (tracker busy, run it again)' : ''}`);
+      continue;
+    }
+    const reserved = await reserve(1, { rootDir: root });
+    const num = reserved[0];
+    try {
+      const f = (s) => String(s ?? '').replace(/[\t\r\n]+/g, ' ').trim();
+      const tsv = 'num\tdate\tcompany\trole\tstatus\tscore\tpdf\treport\tnotes\turl\n'
+        + [num, today, f(lead.company) || '?', f(lead.role) || 'Job lead', status, lead.score != null ? `${lead.score.toFixed(1)}/5` : 'N/A', '❌', '—', f(`${note}${lead.reason ? `: ${lead.reason}` : ''}`), lead.url].join('\t') + '\n';
+      const dir = join(root, 'batch', 'tracker-additions');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, `${String(num).padStart(3, '0')}-${String(lead.company || 'lead').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'lead'}.tsv`), tsv);
+      const m = await run('merge-tracker.mjs', []);
+      if (m.code !== 0) { lines.push(`${name}: FAILED — merge-tracker exit ${m.code}`); continue; }
+      if (action === 'applied') await run('set-status.mjs', ['--row', String(num), 'Applied', '--source', 'web']); // seeds the follow-up; the note is already on the row
+      lines.push(`#${num} ${name}: ${status} (tracker row added)`);
+    } finally {
+      await release(reserved, { rootDir: root }).catch(() => {});
+    }
+  }
+
+  if (toPass.length) {
+    const trackerPath = resolveTrackerPath(root);
+    const tracker = existsSync(trackerPath) ? readTracker(readFileSync(trackerPath, 'utf-8')) : [];
+    const seen = readJson(join(root, 'data', 'prepare-seen.json'), {});
+    const moving = [];
+    for (const { lead, name } of toPass) {
+      const row = tracker.find((t) => t.url && normalizeUrl(t.url) === normalizeUrl(lead.url));
+      if (row && DONE_STATUSES.has(String(row.status).toLowerCase())) { lines.push(`#${row.num} ${name}: already ${row.status} — not moved`); continue; }
+      moving.push({ lead, name, prior: seen[normalizeUrl(lead.url)] });
+    }
+    let moved = [];
+    if (moving.length) {
+      await withPipelineLock(pipelineFile, () => {
+        // Re-read inside the lock: a scan or triage may have written pipeline.md since the first read.
+        let text = readFileSync(pipelineFile, 'utf-8');
+        moved = [];
+        for (const m of moving) { const r = moveLeadToPass(text, m.lead.id); text = r.text; if (r.moved) moved.push(m); }
+        writeFileSync(pipelineFile, text);
+      });
+    }
+    for (const { name, prior } of moved) {
+      lines.push(prior && prior.status !== 'retry'
+        ? `${name}: moved to PASS — but it was already prepared once (${prior.status}), so prepare-new will not redo it`
+        : `${name}: moved to PASS`);
+    }
+    if (moved.length && prepare) {
+      lines.push('Preparing the moved jobs (JD + checks + tracker row, no LLM)…');
+      const p = await run('autopilot/prepare-new.mjs', [], { timeout: 15 * 60_000 });
+      const last = p.out.split(/\r?\n/).filter(Boolean).pop() ?? '';
+      lines.push(p.code === 0 ? `prepare-new: ${last}` : `prepare-new FAILED (exit ${p.code}) — they will be prepared on the next daily run. ${last}`);
+      if (p.code === 0 && publish) lines.push(`They are on the Apply page now — ${await publish()}`);
+      else if (p.code === 0) lines.push('They are on the phone page now; the static site shows them after: node autopilot/publish-site.mjs');
+    } else if (moved.length) {
+      lines.push('They will be prepared on the next daily run (or: node autopilot/prepare-new.mjs).');
+    }
+  }
+  return lines;
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +504,36 @@ async function selfTest() {
     check('no row yet → TSV at its final status + merge', created.status === 200 && tsv.length === 1 && readFileSync(join(root, 'batch', 'tracker-additions', tsv[0]), 'utf-8').split('\n')[1].split('\t')[4] === 'SKIP' && calls[0][0] === 'merge-tracker.mjs');
     const busy = await route({ method: 'POST', url: '/act', headers: good, body: JSON.stringify({ report: 201, action: 'applied' }) }, { ...ctx, run: async () => ({ code: 4, out: 'lock' }) });
     check('tracker lock → 503, not a crash', busy.status === 503);
+
+    check('parseMarks reads the site command', JSON.stringify(parseMarks('201=applied, 202=skip')) === '[{"num":201,"action":"applied"},{"num":202,"action":"skip"}]');
+    check('parseMarks rejects anything else', parseMarks('201=submit') === null && parseMarks('201=applied;rm') === null && parseMarks('') === null);
+    check('parseLeadMarks reads the Filtered page command', JSON.stringify(parseLeadMarks('18182bfa83=applied, a549b42cc3=skip')) === '[{"id":"18182bfa83","action":"applied"},{"id":"a549b42cc3","action":"skip"}]');
+    check('parseLeadMarks rejects anything else', parseLeadMarks('18182bfa83=submit') === null && parseLeadMarks('../x=applied') === null && parseLeadMarks('') === null);
+    check('parseLeadMarks accepts pass', JSON.stringify(parseLeadMarks('18182bfa83=pass')) === '[{"id":"18182bfa83","action":"pass"}]');
+
+    // Move to Pass: the latest filtered line becomes an open PASS row; older lines for the posting are hidden.
+    const pl = [
+      '- [x] https://z.com/9 | Zed | Dev | TLV | lane: il-source | triage: SKIP — old',
+      '- [ ] https://z.com/9 | Zed | Dev | TLV | lane: il-source | triage: FAIL 2.5/5 — too | senior',
+      '- [ ] https://y.com/1 | Why | QA | TLV | triage: MARGINAL 3.0/5 — partial',
+    ].join('\r\n');
+    const mv = moveLeadToPass(pl, leadId('https://z.com/9'));
+    const mvLines = mv.text.split('\r\n');
+    check('moveLeadToPass rewrites the latest line to an open PASS row, keeping the old verdict', mv.moved && mvLines[1] === '- [ ] https://z.com/9 | Zed | Dev | TLV | lane: il-source | triage: PASS 2.5/5 — moved to PASS by you (was FAIL: too / senior)');
+    check('moveLeadToPass hides older lines and leaves others alone', mvLines[0].endsWith('| dup-of: moved-to-pass') && mvLines[2] === pl.split('\r\n')[2]);
+    check('moveLeadToPass: the row is now a PASS row for prepare-new and gone from Filtered', (await import('./prepare.mjs')).selectPassRows(mv.text).some((r) => r.url === 'https://z.com/9') && !readFiltered(mv.text).some((l) => l.url === 'https://z.com/9'));
+    check('moveLeadToPass: unknown id changes nothing', moveLeadToPass(pl, '0000000000').moved === false);
+
+    writeFileSync(join(root, 'data', 'pipeline.md'), pl);
+    calls.length = 0;
+    const pLines = await applyLeadMarks([{ id: leadId('https://y.com/1'), action: 'pass' }], { root, run, today: '2026-10-01' });
+    check('applyLeadMarks pass: writes pipeline.md and runs prepare-new', readFileSync(join(root, 'data', 'pipeline.md'), 'utf-8').includes('https://y.com/1 | Why | QA | TLV | triage: PASS 3.0/5') && calls.some((c) => c[0] === 'autopilot/prepare-new.mjs') && pLines[0].includes('moved to PASS'));
+    writeFileSync(join(root, 'data', 'pipeline.md'), pl);
+    const pubLines = await applyLeadMarks([{ id: leadId('https://y.com/1'), action: 'pass' }], { root, run, today: '2026-10-01', publish: async () => 'site published: x' });
+    check('applyLeadMarks pass + publish: republishes the site after preparing', pubLines.some((l) => l.includes('on the Apply page now — site published: x')));
+    calls.length = 0;
+    const lines = await applyMarks([{ num: 201, action: 'applied' }, { num: 999, action: 'skip' }], { root, run, today: '2026-10-01' });
+    check('applyMarks records via set-status and reports unknown jobs', calls[0]?.join(' ') === 'set-status.mjs --report 201 Applied --note applied via phone --source web' && lines[0].includes('Applied') && lines[1].includes('not in the apply list'));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -358,6 +546,18 @@ if (isMainModule(import.meta.url)) {
   const args = process.argv.slice(2);
   if (hasFlag(args, '--self-test')) {
     process.exitCode = (await selfTest()) ? 0 : 1;
+  } else if (hasFlag(args, '--mark')) {
+    const marks = parseMarks(flagValue(args, '--mark'));
+    if (!marks) { console.error('Usage: node autopilot/phone-server.mjs --mark 134=applied,129=skip   (copy it from the site\'s Apply page)'); process.exitCode = 1; }
+    else for (const line of await applyMarks(marks)) console.log(line);
+  } else if (hasFlag(args, '--mark-followup')) {
+    const marks = parseFollowupMarks(flagValue(args, '--mark-followup'));
+    if (!marks) { console.error('Usage: node autopilot/phone-server.mjs --mark-followup 135=followed,136=retire   (copy it from the Follow up page of the site)'); process.exitCode = 1; }
+    else for (const line of await applyFollowupMarks(marks)) console.log(line);
+  } else if (hasFlag(args, '--mark-lead')) {
+    const marks = parseLeadMarks(flagValue(args, '--mark-lead'));
+    if (!marks) { console.error('Usage: node autopilot/phone-server.mjs --mark-lead 3f2a9c01be=applied|skip|pass,…   (copy it from the site\'s Filtered page)'); process.exitCode = 1; }
+    else for (const line of await applyLeadMarks(marks, { publish: async () => (await import('./publish-site.mjs')).publishSite() })) console.log(line);
   } else {
     dotenv.config({ path: join(ROOT, '.env'), quiet: true });
     const token = process.env.AUTOPILOT_PHONE_TOKEN;

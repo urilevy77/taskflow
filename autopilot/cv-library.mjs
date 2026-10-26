@@ -25,7 +25,7 @@
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, copyFileSync, renameSync, mkdtempSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { join, relative } from 'node:path';
+import { join, relative, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { getCareerOpsRoot } from '../path-resolver.mjs';
 import { jaccardSimilarity } from '../jd-similarity.mjs';
@@ -114,6 +114,48 @@ export function lookup({ title, jd, cvMd, root }) {
   return { decision: 'tailor', role, reason: 'no-cv-for-role' };
 }
 
+// ── Provenance: where a CV PDF came from ─────────────────────────────────────
+
+const niceRole = (r) => String(r ?? '').replace(/_/g, ' ');
+
+/**
+ * Where a CV came from, read from files next to the PDF. Never throws; null when unknown.
+ *   job CV  output/NNN-…/cv/tailored/vNNN/  → source.json (written by tailor.mjs); older versions are read from changes.md + state.json
+ *   library CVs/<Role>/ (or history/vNNN/)  → meta.json
+ * → { kind: 'tailored'|'reused'|'library'|'base', for_title?, from_role?, from_version?, first_title?, based_on_role?, revised? }
+ */
+export function cvSource(pdf) {
+  if (!pdf) return null;
+  const dir = dirname(pdf);
+  const src = readJson(join(dir, 'source.json'));
+  if (src) return src;
+  const meta = readJson(join(dir, 'meta.json'));
+  if (meta) return meta.role === BASE_ROLE || meta.source === 'seed-base' ? { kind: 'base' } : { kind: 'library', from_role: meta.role, from_version: meta.version, first_title: meta.title ?? null };
+  const changes = existsSync(join(dir, 'changes.md')) ? readFileSync(join(dir, 'changes.md'), 'utf-8') : '';
+  const state = readJson(join(dir, '..', '..', '..', 'state.json'));
+  if (!changes && !state) return null;
+  const reused = changes.match(/Reused unchanged from the CV library: CVs\/([^/]+)\/ \(v(\d+)/);
+  if (reused) {
+    const [, role, v] = reused;
+    const lib = roleDir(role, join(dir, '..', '..', '..', '..', '..'));
+    const m = [readJson(join(lib, 'meta.json')), readJson(join(lib, 'history', `v${v.padStart(3, '0')}`, 'meta.json'))].find((x) => x && String(x.version) === v);
+    return { kind: 'reused', for_title: state?.role ?? null, from_role: role, from_version: Number(v), first_title: m?.title ?? null };
+  }
+  return { kind: 'tailored', for_title: state?.role ?? null, revised: /^Revision note:/m.test(changes) };
+}
+
+/** One human line for a cvSource() result. '' when unknown. */
+export function describeCvSource(s) {
+  if (!s) return '';
+  if (s.kind === 'base' || s.from_role === BASE_ROLE) return 'General CV (from cv.md, not tailored to a job)';
+  if (s.kind === 'tailored') {
+    const t = s.for_title ? `Tailored for “${s.for_title}”` : 'Tailored for this job';
+    return `${t}${s.based_on_role ? ` (adapted from the ${niceRole(s.based_on_role)} CV)` : ''}${s.revised ? ' · revised' : ''}`;
+  }
+  const first = s.first_title ? `, first tailored for “${s.first_title}”` : '';
+  return `Existing CV: ${niceRole(s.from_role)}${s.from_version ? ` v${s.from_version}` : ''}${first}`;
+}
+
 // ── Library writes ─────────────────────────────────────────────────────────
 
 const ARTIFACTS = ['render.json', 'source_jd.md', 'meta.json'];
@@ -188,6 +230,23 @@ function selfTest() {
     const e2 = save({ role: 'Software_Engineer', pdf, renderJson: { ...render, summary: 'v2' }, jd, cvMd, root });
     check('resave → version 2, v1 archived, not lost', e2.meta.version === 2 && existsSync(join(root, 'CVs', 'Software_Engineer', 'history', 'v001', 'Uri_Levy_CV.pdf')) && readJson(join(root, 'CVs', 'Software_Engineer', 'history', 'v001', 'render.json')).summary === 'v1');
     check('list returns the entry', list(root).length === 2 && list(root).every((e) => e.role !== '_Base'));
+
+    // Provenance
+    save({ role: 'AI_ML_Engineer', pdf, renderJson: render, jd, cvMd, root, meta: { title: 'AI Engineer', company: 'Acme' } });
+    const lib = cvSource(join(root, 'CVs', 'AI_ML_Engineer', 'Uri_Levy_CV.pdf'));
+    check('source: library CV names its first title', lib.kind === 'library' && describeCvSource(lib) === 'Existing CV: AI ML Engineer v1, first tailored for “AI Engineer”');
+    save({ role: BASE_ROLE, pdf, renderJson: render, jd, cvMd, root, meta: { source: 'seed-base' } });
+    check('source: base CV', describeCvSource(cvSource(join(root, 'CVs', BASE_ROLE, 'Uri_Levy_CV.pdf'))).startsWith('General CV'));
+    const b = join(root, 'output', '201-acme'), v1 = join(b, 'cv', 'tailored', 'v001'), v2 = join(b, 'cv', 'tailored', 'v002'), v3 = join(b, 'cv', 'tailored', 'v003');
+    for (const v of [v1, v2, v3]) mkdirSync(v, { recursive: true });
+    writeFileSync(join(b, 'state.json'), JSON.stringify({ role: 'ML Engineer', company: 'Acme' }));
+    writeFileSync(join(v1, 'changes.md'), '# Changes vs cv.md (v001)\n\nReused unchanged from the CV library: CVs/AI_ML_Engineer/ (v1, JD overlap 0.30 (advisory)). No LLM call.\n');
+    check('source: legacy reused job CV (from changes.md)', describeCvSource(cvSource(join(v1, 'cv.pdf'))) === 'Existing CV: AI ML Engineer v1, first tailored for “AI Engineer”');
+    writeFileSync(join(v2, 'changes.md'), '# Changes vs cv.md (v002)\n\nRevision note: shorter\n\n- x\n');
+    check('source: legacy tailored job CV (title from state.json)', describeCvSource(cvSource(join(v2, 'cv.pdf'))) === 'Tailored for “ML Engineer” · revised');
+    writeFileSync(join(v3, 'source.json'), JSON.stringify({ kind: 'tailored', for_title: 'ML Engineer', based_on_role: 'Software_Engineer' }));
+    check('source: source.json wins', describeCvSource(cvSource(join(v3, 'cv.pdf'))) === 'Tailored for “ML Engineer” (adapted from the Software Engineer CV)');
+    check('source: unknown → empty', cvSource(join(root, 'nowhere', 'cv.pdf')) === null && describeCvSource(null) === '');
   } finally { rmSync(root, { recursive: true, force: true }); }
   console.log(`cv-library.mjs self-test: ${pass} passed, ${fail} failed`);
   return fail === 0;

@@ -20,6 +20,7 @@ import dotenv from 'dotenv';
 import { getCareerOpsRoot } from '../path-resolver.mjs';
 import { isMainModule } from '../lib/is-main-module.mjs';
 import { buildApplyKit, summaryFromCv, sourcesTableHtml } from './apply-kit.mjs';
+import { loadDue } from './followups.mjs';
 
 const ROOT = getCareerOpsRoot();
 
@@ -54,10 +55,26 @@ export function readSources() {
   } catch { return []; }
 }
 
+/** How many follow-ups the email lists; the rest are one tap away on the site's /followups page. */
+export const EMAIL_FOLLOWUPS = 5;
+
+/** Pure: the "Follow up today" block of the email — { text: string[], html }. `fu` is loadDue()'s { total, items }; empty when nothing is due. */
+export function followupsSection(fu, siteBase = '') {
+  if (!fu?.total) return { text: [], html: '' };
+  const what = (i) => `${i.company || 'Company not recorded'} — ${i.role}`;
+  const age = (i) => (i.status === 'applied' ? `applied ${i.daysSinceApplication}d ago` : i.status === 'interview' ? 'interview — thank-you / check-in' : 'they replied — answer them');
+  const link = siteBase ? `${siteBase}/followups` : '';
+  const more = fu.total > fu.items.length ? `+${fu.total - fu.items.length} more` : '';
+  const text = [`Follow up today (${fu.total}):`, ...fu.items.map((i) => `  - ${what(i)} (${age(i)})`), ...(more ? [`  ${more}`] : []), ...(link ? [`  Drafts: ${link}`] : [])];
+  const html = `<h3 style="margin:16px 0 4px">Follow up today (${fu.total})</h3><ul style="margin:0;padding-left:20px">${fu.items.map((i) => `<li><b>${esc(what(i))}</b> <span style="color:#57606a">${esc(age(i))}</span></li>`).join('')}</ul>${more ? `<p style="margin:4px 0;color:#57606a">${more}</p>` : ''}${link ? `<p style="margin:6px 0"><a href="${esc(link)}">Open the drafts →</a></p>` : ''}`;
+  return { text, html };
+}
+
 /** Pure: digest → { subject, text, html, attachments }. `kit` is buildApplyKit()'s result, or null; `sources` (Mondays) adds the funnel table. */
 export function buildReport(digest, todos = [], kit = null, sources = [], opts = {}) {
   const stages = digest.stages ?? [];
   const failed = stages.filter((s) => !s.ok);
+  const fuBlock = followupsSection(opts.followups, opts.siteBase);
   const secs = (ms) => `${(ms / 1000).toFixed(1)}s`;
   const totalMs = new Date(digest.finished_at).getTime() - new Date(digest.started_at).getTime();
   const day = String(digest.started_at ?? '').slice(0, 10);
@@ -68,6 +85,7 @@ export function buildReport(digest, todos = [], kit = null, sources = [], opts =
 
   const text = [
     ...(kit && kit.text ? [kit.text, '', '—'.repeat(20)] : []),
+    ...(fuBlock.text.length ? [...fuBlock.text, '', '—'.repeat(20)] : []),
     `Run ${digest.run_id}`,
     `Started ${digest.started_at} — finished ${digest.finished_at} (${secs(totalMs)})`,
     `${stages.length - failed.length}/${stages.length} stages ok`,
@@ -79,17 +97,17 @@ export function buildReport(digest, todos = [], kit = null, sources = [], opts =
   const rows = stages
     .map((s) => `<tr><td>${s.ok ? '✅' : '❌'}</td><td><b>${esc(s.name)}</b></td><td>${secs(s.durationMs)}</td><td>${esc(s.summary)}${s.detail ? `<pre style="white-space:pre-wrap;font-size:11px;background:#f6f8fa;padding:6px">${esc(s.detail)}</pre>` : ''}</td></tr>`)
     .join('');
-  const html = `<div style="font-family:sans-serif;max-width:640px"><h2>${esc(subject)}</h2>${kit ? kit.html : ''}<h3>Run details</h3>
+  const html = `<div style="font-family:sans-serif;max-width:640px"><h2>${esc(subject)}</h2>${kit ? kit.html : ''}${fuBlock.html}<h3>Run details</h3>
 <p>Run <code>${esc(digest.run_id)}</code><br>${esc(digest.started_at)} → ${esc(digest.finished_at)} (${secs(totalMs)})</p>
 <table cellpadding="6" style="border-collapse:collapse;border:1px solid #ccc">${rows}</table>${todos.length ? `<h3>Open to-dos (${todos.length})</h3><ul>${todos.map((t) => `<li>${esc(t)}</li>`).join('')}</ul>` : ''}</div>`;
-  if (opts.reportUrl) return buildCompactReport({ subject, stages, failed, totalMs, kit, scan: opts.scan, reportUrl: opts.reportUrl, todos });
+  if (opts.reportUrl) return buildCompactReport({ subject, stages, failed, totalMs, kit, scan: opts.scan, reportUrl: opts.reportUrl, todos, fuBlock });
   const closing = '</div>';
   const withSources = sources && sources.length && html.endsWith(closing) ? `${html.slice(0, -closing.length)}${sourcesTableHtml(sources)}${closing}` : html;
   return { subject, text, html: withSources, attachments: kit ? kit.attachments : [] };
 }
 
 /** Compact email: headline, the numbers that matter, and a button to the full web report. */
-function buildCompactReport({ subject, stages, failed, totalMs, kit, scan, reportUrl, todos }) {
+function buildCompactReport({ subject, stages, failed, totalMs, kit, scan, reportUrl, todos, fuBlock }) {
   const mins = `${(totalMs / 60000).toFixed(1)} min`;
   const t = scan?.totals;
   const bad = scan ? scan.boards.filter((b) => b.status !== 'reachable' && b.status !== 'empty').length : 0;
@@ -103,9 +121,9 @@ function buildCompactReport({ subject, stages, failed, totalMs, kit, scan, repor
   const btn = 'display:inline-block;background:#0969da;color:#fff;padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:600';
   const html = `<div style="font-family:sans-serif;max-width:560px"><h2>${esc(subject)}</h2>
 <ul>${lines.map((l) => `<li>${esc(l)}</li>`).join('')}</ul>
-<p><a href="${esc(reportUrl)}" style="${btn}">Open the full run report</a></p>
+${fuBlock.html}<p><a href="${esc(reportUrl)}" style="${btn}">Open the full run report</a></p>
 <p style="color:#57606a;font-size:12px">Per-source scan status, stages, WhatsApp groups and your to-do list are on the page.${todos.length ? ` ${todos.length} open to-dos.` : ''}</p></div>`;
-  return { subject, text: `${lines.join('\n')}\n\nFull report: ${reportUrl}`, html, attachments: kit ? kit.attachments : [] };
+  return { subject, text: `${lines.join('\n')}\n\n${fuBlock.text.length ? `${fuBlock.text.join('\n')}\n\n` : ''}Full report: ${reportUrl}`, html, attachments: kit ? kit.attachments : [] };
 }
 
 /** Sends the report. Returns a short status string; never throws. */
@@ -132,7 +150,7 @@ export async function sendRunReport(digest) {
     const { siteUrl, scanStatusFor } = await import('./publish-site.mjs');
     const base = siteUrl();
     const reportUrl = base ? `${base}/run/${day}` : '';
-    const { subject, text, html, attachments } = buildReport(digest, readOpenTodos(), kit, isMonday ? readSources() : [], { reportUrl, scan: reportUrl ? scanStatusFor(digest, day) : undefined });
+    const { subject, text, html, attachments } = buildReport(digest, readOpenTodos(), kit, isMonday ? readSources() : [], { reportUrl, siteBase: base, followups: loadDue(ROOT, { cap: EMAIL_FOLLOWUPS }), scan: reportUrl ? scanStatusFor(digest, day) : undefined });
     await transport.sendMail({ from: user, to, subject, text, html, attachments });
     return `mail sent to ${to}`;
   } catch (err) {
@@ -163,6 +181,13 @@ function selfTest() {
   check('no sources table when none given', !buildReport({ ...base, stages: [] }).html.includes('Sources (all time)'));
   const compact = buildReport({ ...base, stages: [{ name: 'scan', ok: true, summary: 'ok', durationMs: 1 }] }, ['t'], null, [], { reportUrl: 'http://h:1/run/2026-09-30?t=x', scan: { totals: { found: '9', new_added: '2', dupes: '1', errors: '0' }, boards: [{ status: 'network' }, { status: 'reachable' }] } });
   check('compact mail links to the report and skips the stage table', compact.html.includes('href="http://h:1/run/2026-09-30?t=x"') && !compact.html.includes('Run details') && compact.text.includes('Sources: 2 scanned, 1 with problems'));
+  const fu = { total: 7, items: [{ company: 'Acme', role: 'Backend <Eng>', status: 'applied', daysSinceApplication: 9 }, { company: '', role: 'Data', status: 'responded', daysSinceApplication: 3 }] };
+  const withFu = buildReport({ ...base, stages: [] }, [], null, [], { followups: fu, siteBase: 'https://s.pages.dev' });
+  check('follow-ups section: counts, escaped role, "+N more", link', withFu.html.includes('Follow up today (7)') && withFu.html.includes('Backend &lt;Eng&gt;') && withFu.html.includes('+5 more') && withFu.html.includes('https://s.pages.dev/followups') && withFu.text.includes('Follow up today (7):'));
+  check('follow-ups section: unrecorded company and replied rows are worded', withFu.text.includes('Company not recorded — Data (they replied — answer them)'));
+  check('nothing due → no section', !buildReport({ ...base, stages: [] }, [], null, [], { followups: { total: 0, items: [] } }).html.includes('Follow up today'));
+  const fuCompact = buildReport({ ...base, stages: [] }, [], null, [], { reportUrl: 'https://s/run/x', followups: fu, siteBase: 'https://s' });
+  check('compact mail carries the follow-ups too', fuCompact.html.includes('Follow up today (7)') && fuCompact.text.includes('Follow up today (7):'));
   const detailR =buildReport({ ...base, stages: [{ name: 'triage', ok: false, summary: 'FAILED', durationMs: 1, detail: 'boom <x>' }] });
   check('failed-stage detail is shown and escaped', detailR.html.includes('boom &lt;x&gt;'));
   if (failures) process.exitCode = 1; else console.log('\nAll self-tests passed.');

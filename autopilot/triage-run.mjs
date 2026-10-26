@@ -29,7 +29,7 @@
 //   node autopilot/triage-run.mjs --dry-run         # print what would be written
 //   node autopilot/triage-run.mjs --self-test       # in-memory suite; spawns no subprocess
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { getCareerOpsRoot } from '../path-resolver.mjs';
@@ -161,6 +161,8 @@ export function buildTriagePrompt(jobs) {
     `JOBS (${jobs.length}):`,
     listing,
     '',
+    'Start each {reason} with ONE plain sentence ending in a period: the single strongest reason the candidate fits this role, or the single strongest reason they do not (e.g. "Direct AI Engineer match: agents and RAG map to the Jeen AI role."). Any further detail goes after " — ", inside the same word limit.',
+    '',
     `Output EXACTLY ${jobs.length} lines, one TRIAGE: line per job above, in the same order, and nothing else — no headers, no blank lines between them, no commentary before or after.`,
   ].join('\n');
 }
@@ -204,6 +206,17 @@ export async function prefetchJd(url, company, title) {
   const body = `# ${result.title || `${company} — ${title}`}\n\nSource: ${url}\n\n${result.text}`;
   writeFileSync(join(JDS_DIR, filename), body);
   return `local:jds/${filename}`;
+}
+
+/**
+ * An existing jds/ capture for this URL — any file ending in `-{sha1(url)[0:10]}.md` (the naming this
+ * file and goozali-jobs.mjs share) → `local:jds/{file}`, else null.
+ */
+export async function findLocalJd(url, dir = JDS_DIR) {
+  if (!existsSync(dir)) return null;
+  const suffix = `-${await shortHash(url)}.md`;
+  const hit = readdirSync(dir).find((f) => f.endsWith(suffix));
+  return hit ? `local:jds/${hit}` : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -346,7 +359,7 @@ async function main(argv) {
     return 0;
   }
   if (hasFlag(argv, '--self-test')) {
-    selfTest();
+    await selfTest();
     return 0;
   }
   if (!existsSync(PIPELINE_PATH)) {
@@ -447,8 +460,9 @@ async function main(argv) {
     const batch = selected.slice(i, i + CLI_BATCH_SIZE);
     const jobs = [];
     for (const e of batch) {
-      let ref = e.url;
-      if (e.lane === 'api-jd') {
+      // A capture an intake source already saved (goozali-jobs.mjs) beats any fetch.
+      let ref = (await findLocalJd(e.url).catch(() => null)) ?? e.url;
+      if (ref === e.url && e.lane === 'api-jd') {
         const local = await prefetchJd(e.url, e.company, e.title).catch(() => null);
         if (local) ref = local;
       }
@@ -519,7 +533,7 @@ async function main(argv) {
 // Self-test — in-memory, touches no real files, spawns no subprocess
 // ---------------------------------------------------------------------------
 
-function selfTest() {
+async function selfTest() {
   let failures = 0;
   const check = (name, cond) => {
     if (!cond) { console.error(`FAIL: ${name}`); failures += 1; }
@@ -583,6 +597,17 @@ function selfTest() {
   check('batch parse tolerates surrounding prose', parseTriageBatchOutput(`Sure, here you go:\n${batchOut}\nDone.`, 2)?.length === 2);
 
   check('formatTriageSegment sanitizes pipes', formatTriageSegment('PASS', 4.567, 'has a | pipe').includes('/') && !formatTriageSegment('PASS', 4.567, 'has a | pipe').slice(20).includes('|'));
+  {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const d = mkdtempSync(join(tmpdir(), 'jds-'));
+    try {
+      const url = 'https://acme.com/j/1';
+      writeFileSync(join(d, `acme-dev-${await shortHash(url)}.md`), '# x');
+      check('findLocalJd: finds a capture by URL hash', (await findLocalJd(url, d)) === `local:jds/acme-dev-${await shortHash(url)}.md`);
+      check('findLocalJd: none for another URL', (await findLocalJd('https://acme.com/j/2', d)) === null);
+    } finally { rmSync(d, { recursive: true, force: true }); }
+  }
   check('formatTriageSegment clamps score', formatTriageSegment('PASS', 9.9, 'x').includes('5.0/5'));
 
   const pipelineFixture = [

@@ -203,7 +203,8 @@ export async function tailor({ query, note, cliName, dryRun = false, fresh = fal
       const pdf = join(vdir, 'cv.pdf');
       copyFileSync(hit.entry.pdf, pdf);
       copyFileSync(hit.entry.renderPath, join(vdir, 'render.json'));
-      writeFileSync(join(vdir, 'changes.md'), `# Changes vs cv.md (${vname})\n\nReused unchanged from the CV library: CVs/${hit.role}/ (v${hit.entry.meta.version}${scoreText(hit)}). No LLM call.\n`);
+      writeFileSync(join(vdir, 'changes.md'), `# Changes vs cv.md (${vname})\n\nReused unchanged from the CV library: CVs/${hit.entry.role}/ (v${hit.entry.meta.version}${scoreText(hit)}). No LLM call.\n`);
+      writeFileSync(join(vdir, 'source.json'), JSON.stringify({ kind: 'reused', for_title: state.role, from_role: hit.entry.role, from_version: hit.entry.meta.version, first_title: hit.entry.meta.title ?? null }, null, 2) + '\n');
       state.stages = { ...state.stages, [`cv:${vname}`]: new Date().toISOString().slice(0, 10) };
       state.gate = 'gate-2';
       state.updated_at = new Date().toISOString();
@@ -240,6 +241,7 @@ export async function tailor({ query, note, cliName, dryRun = false, fresh = fal
   const jsonPath = join(vdir, 'render.json');
   writeFileSync(jsonPath, JSON.stringify(payload, null, 2) + '\n');
   writeFileSync(join(vdir, 'changes.md'), `# Changes vs cv.md (v${String(version).padStart(3, '0')})\n\n${note ? `Revision note: ${note}\n\n` : ''}${_changes.map((c) => `- ${c}`).join('\n')}\n`);
+  writeFileSync(join(vdir, 'source.json'), JSON.stringify({ kind: 'tailored', for_title: state.role, based_on_role: hit?.decision === 'reuse-with-edits' ? hit.entry.role : null, revised: Boolean(note) }, null, 2) + '\n');
 
   const rendered = renderPipeline({ jsonPath, vdir, reportNum: state.report_num });
   if (!rendered.ok) return rendered;
